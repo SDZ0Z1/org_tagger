@@ -407,7 +407,8 @@ sudo aws s3 cp s3://org-tagger-<Payer账号ID>/bin/org_tagger.py /opt/org-tagger
 | 情况 | 处理方法 |
 | --- | --- |
 | 新账号加入组织 | Organizations 新建的账号自带角色，脚本下次运行会自动纳入。邀请加入的账号要先按[第 3 步](#3-成员账号创建角色)建角色。不在范围内的账号加进 `EXCLUDE_ACCOUNTS` |
-| `ERROR`：assume role 失败 | 该账号没有 `OrganizationAccountAccessRole`，或角色信任的不是 Payer 账号 ID。用[第 2 步的检查循环](#检查哪些账号缺角色)确认 |
+| `ERROR`：assume role 失败，region 列为 `-` | 该账号没有 `OrganizationAccountAccessRole`，或角色信任的不是 Payer 账号 ID。用[第 2 步的检查循环](#检查哪些账号缺角色)确认 |
+| `ERROR`：assume role 失败，region 列是具体 region | 运行途中重新取凭证失败（多半是 STS 限流），只跳过了这个 region，下次运行会补上。连续几天都出现，再按上一行检查角色 |
 | 成员账号里的资源 `FAILED`，detail 含 AccessDenied | 角色是管理员权限，这种情况几乎都是 SCP 拒绝，检查作用于该账号的 SCP |
 | Payer 自己的资源 `FAILED`，detail 含 AccessDenied | EC2 实例角色缺这类服务的打标签权限。把对应 action 加进 `org-tagger-policy.json`，再执行一次 `put-role-policy`（见 [4.2](#42-创建-ec2-实例角色)） |
 | 标签值要改（例如换 MPE 值） | 改配置里的 `TAG_VALUE`，旧值会显示为 `CONFLICT`。确认要覆盖时在 `EXTRA_ARGS` 加 `--overwrite` 跑一次，跑完删掉，避免以后误覆盖别人打的值 |

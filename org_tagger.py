@@ -374,7 +374,12 @@ def process_account(acct_id, acct_name, mgmt_id, args, report):
     seen = set()   # 去重：第一层处理过的资源，第二层补扫时跳过
 
     def run(handlers, region, region_label):
-        sess = get_session(acct_id, mgmt_id, args.role_name)
+        try:
+            sess = get_session(acct_id, mgmt_id, args.role_name)
+        except Exception as e:  # noqa: BLE001
+            # 中途重新 assume 失败（限流、角色被改等），记下来，跳过这个 region 继续跑
+            report.row(acct_id, acct_name, region_label, "assume_role", "", "", "ERROR", str(e)[:500])
+            return
         ctx = Ctx(sess, region, args.tag_key, args.tag_value)
         for h in handlers:
             try:
