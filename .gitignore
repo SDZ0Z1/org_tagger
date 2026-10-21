@@ -1,0 +1,9 @@
+# 运行产生的报告（含账号 ID 和资源 ARN）
+*.csv
+reports/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
