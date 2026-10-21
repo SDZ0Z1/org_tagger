@@ -277,10 +277,10 @@ sudo aws s3 cp s3://$BUCKET/bin/org_tagger.py /opt/org-tagger/
 
 ### 4.5 写配置文件和运行脚本
 
-配置文件集中放标签和运行模式。先保持 `MODE=dryrun`，审完报告再改成 `apply`。
+配置文件 `/opt/org-tagger/.env` 集中放标签和运行模式（文件名以点开头，`ls` 默认不显示，要用 `ls -a`）。先保持 `MODE=dryrun`，审完报告再改成 `apply`。
 
 ```bash
-sudo tee /opt/org-tagger/org-tagger.env > /dev/null << 'EOF'
+sudo tee /opt/org-tagger/.env > /dev/null << 'EOF'
 # 要打的标签
 TAG_KEY=map-migrated
 TAG_VALUE=migXXXXXXXXXX
@@ -302,7 +302,7 @@ EOF
 sudo tee /opt/org-tagger/run.sh > /dev/null << 'EOF'
 #!/bin/bash
 set -euo pipefail
-set -a; source /opt/org-tagger/org-tagger.env; set +a
+set -a; source /opt/org-tagger/.env; set +a
 cd /opt/org-tagger
 
 OUT="/opt/org-tagger/reports/report-$(date +%Y%m%d-%H%M%S).csv"
@@ -381,7 +381,7 @@ sudo aws s3 cp s3://org-tagger-<Payer账号ID>/bin/org_tagger.py /opt/org-tagger
 4. **正式执行**：把模式改成 apply 后再手动跑一次。
 
    ```bash
-   sudo sed -i 's/^MODE=.*/MODE=apply/' /opt/org-tagger/org-tagger.env
+   sudo sed -i 's/^MODE=.*/MODE=apply/' /opt/org-tagger/.env
    sudo systemctl start org-tagger.service
    ```
 

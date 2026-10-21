@@ -2,6 +2,9 @@
 *.csv
 reports/
 
+# 运行配置（MPE 值、排除的账号 ID 等），只放在 EC2 上
+.env
+
 # Python
 __pycache__/
 *.pyc
