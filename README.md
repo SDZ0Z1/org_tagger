@@ -1,39 +1,121 @@
 # org-tagger
 
-给 AWS Organizations 里所有账号的资源统一补一个标签。脚本在管理账号（Payer）上运行，逐个 assume 成员账号里的 `OrganizationAccountAccessRole`，给缺少该标签的资源补上，并输出 CSV 报告。
+给 AWS Organizations 里 MAP 范围内账号的资源统一补上 `map-migrated` 标签。全部用 Lambda，分两层：
 
-主要用于 MAP（Migration Acceleration Program）项目的 `map-migrated` 标签，也适用于其它“全组织统一打一个标签”的场景。
+- **实时层**（[realtime_tagger.py](realtime_tagger.py)）：StackSets 目标 OU 里每个账号的每个 region 里一个 Lambda。资源一创建就由 CloudTrail 事件触发，几分钟内打上标签。
+- **每日扫描**（[sweep_tagger.py](sweep_tagger.py)）：Payer（管理账号）里的一个 Lambda，由 EventBridge Scheduler 每天 02:00 触发。它按账号映射表，assume 进各账号的 `MapTaggerRole`，把实时层漏掉的补上。
 
-- **默认 dry-run**：不加 `--apply` 不会改动任何资源，只出报告。
-- **不覆盖已有值**：资源上已有同名 key 但值不同时记为 `CONFLICT`，加 `--overwrite` 才覆盖。
+之所以要实时层：账单按小时记录资源当时带着的标签，后补的标签不会追溯。只靠每日扫描，资源从创建到被补上标签（最长约一天）这段时间的消费不带标签，这部分拿不到 MAP credit。
+
+账号映射表是 Payer 里的一个 SSM 参数，记录每个白名单账号对应的 MPE 值。它就是白名单：不在表里的账号，两层都不处理。Payer 用 RAM 把它共享给组织，两层读的是同一份，所以每个账号的 MPE 值只在一个地方维护。
+
+部署用 StackSets 按 OU 自动下发：目标 OU 里已有的、以后新建或移入的账号都会自动部署好两个角色和实时层 Lambda。其中的非 MAP 账号不在映射表里，这些组件在那里只空转。所以目标 OU 里的账号要加入 MAP，只需要在映射表里加一行。
+
+两层的处理规则一致：
+
+- **默认 dry-run**：`MODE=apply` 之前只写日志，不改动任何资源。
+- **不覆盖已有值**：资源上已有同名 key 但值不同时记为 `CONFLICT`，设 `OVERWRITE=true` 才会覆盖。
 - **只追加**：只写入这一个标签，不动资源上的其它标签。
-- **出错不中断**：单个资源、单个服务或单个账号出错，只在报告里记一行，继续处理其它。
+- **出错不中断**：单个资源、单个服务或单个账号出错，只在日志里记一行，继续处理其它。
 
-部署到 Payer 的 EC2 上每天定时运行的完整步骤见 [DEPLOY.md](DEPLOY.md)。
+部署步骤见 [DEPLOY.md](DEPLOY.md)：Payer 里的部分在控制台配置一次，成员账号里的部分用 CloudFormation StackSets 按 OU 自动下发。
 
 ## 仓库内容
 
 | 文件 | 说明 |
 | --- | --- |
-| [org_tagger.py](org_tagger.py) | 脚本本体，单文件，只依赖 boto3 |
-| [DEPLOY.md](DEPLOY.md) | 部署与运维：成员账号角色、Payer 上的 EC2 和每日定时任务、首次上线流程、常见问题 |
+| [realtime_tagger.py](realtime_tagger.py) | 实时层的 Lambda 函数，由 StackSets 部署到目标 OU 里每个账号的每个 region |
+| [sweep_tagger.py](sweep_tagger.py) | 每日扫描的 Lambda 函数，部署在 Payer |
+| [templates/map-tagger-roles.yaml](templates/map-tagger-roles.yaml) | StackSet 模板：`MapTaggerRole` 和实时层的执行角色 `MapRealtimeTaggerRole` |
+| [templates/map-tagger-realtime.yaml](templates/map-tagger-realtime.yaml) | StackSet 模板：实时层 Lambda 和 EventBridge 规则，代码内联在模板里 |
+| [make_templates.py](make_templates.py) | 生成上面两个模板。改了 `realtime_tagger.py` 或权限列表后重新运行 |
+| [DEPLOY.md](DEPLOY.md) | 部署与运维：Payer 配置、StackSets 下发、首次上线、常见问题 |
 
-## 工作原理
+两个函数都是单文件，只用 Lambda 运行时自带的 boto3。扫描函数在 Payer 的控制台里粘贴代码；实时层的代码由 `make_templates.py` 内联进模板，随 StackSet 下发。
 
-1. 用当前凭证确认管理账号 ID，从 Organizations 列出所有 `ACTIVE` 账号，再按 `--accounts` / `--exclude-accounts` 过滤。
-2. 多个账号并行处理（`--workers`，默认 8）。管理账号自己直接用当前凭证；成员账号 assume `--role-name` 指定的角色。每处理一个 region 都重新 assume 一次，避免长时间运行时 1 小时的临时凭证过期。
-3. 每个账号先处理全局资源（S3、CloudFront，只跑一次），再逐个处理 region（默认是该账号已启用的全部 region）。
-4. 每个 region 分两层枚举资源：
-   - **第一层：服务原生 API。** 能找到从没打过任何标签的资源，覆盖的类型见下表。
-   - **第二层：Resource Groups Tagging API 补扫。** 用 `GetResources` 覆盖第一层没写到的类型（SNS、SQS、KMS、日志组等），但它只返回“当前有标签或曾经打过标签”的资源。第一层处理过的资源会跳过，不重复记录。用 `--no-sweep` 可以关掉这一层。
-5. 对每个资源比较该 key 的现值，记为 `OK`、`CONFLICT`、`WOULD_TAG`、`TAGGED` 或 `FAILED`，写入报告。
+`templates/` 下的文件不要手动修改，改 `make_templates.py` 或 `realtime_tagger.py` 后重新生成：
 
-## 覆盖的资源类型
+```bash
+python make_templates.py
+```
 
-| 范围 | 报告里的 type | 说明 |
+## 实时层（realtime_tagger.py）
+
+### 工作原理
+
+1. 有人创建资源（例如 RunInstances、CreateBucket），CloudTrail 记下这次 API 调用，投递到同账号、同 region 的 EventBridge 默认事件总线。
+2. EventBridge 规则按事件来源和事件名匹配，触发同 region 的 Lambda。规则只匹配下表里的创建类 API，不含 CreateTags 这类打标签操作，所以 Lambda 自己打标签不会再触发自己。
+3. Lambda 用完整 ARN 读取 Payer 共享过来的账号映射表，查出本账号的 MPE 值；映射表缓存 5 分钟。本账号不在表里就记一行 `SKIP`，不处理。
+4. Lambda 从事件里取出新资源的 ID 或 ARN，读出现有标签，按上面的规则决定记为 `OK`、`CONFLICT`、`WOULD_TAG` 还是打上标签（`TAGGED`）。
+5. RunInstances 还会等实例进入 running，再给启动时一起创建的 EBS 卷打标签。这些卷没有单独的 CreateVolume 事件。
+6. 资源刚创建时，有的服务会拒绝读写标签。函数每 10 秒重试一次，最多 6 次；还失败就记 `FAILED`，并让这次调用报错，Lambda 默认会再重试两次。最终仍失败的，由第二天的每日扫描补上。
+
+### 覆盖的 API
+
+| 资源类型 | 触发的 API |
+| --- | --- |
+| `ec2:instance` | RunInstances（连同启动时创建的 EBS 卷，记为 `ec2:volume`） |
+| `ec2:volume` | CreateVolume |
+| `ec2:snapshot` | CreateSnapshot、CreateSnapshots、CopySnapshot |
+| `ec2:image` | CreateImage、CopyImage、RegisterImage（AMI 背后的快照不在内，由每日扫描处理） |
+| `ec2:elastic-ip` | AllocateAddress |
+| `ec2:natgateway` | CreateNatGateway |
+| `ec2:vpc-endpoint` | CreateVpcEndpoint |
+| `rds:db` | CreateDBInstance、CreateDBInstanceReadReplica、RestoreDBInstanceFromDBSnapshot、RestoreDBInstanceToPointInTime、RestoreDBInstanceFromS3 |
+| `rds:cluster` | CreateDBCluster、RestoreDBClusterFromSnapshot、RestoreDBClusterToPointInTime、RestoreDBClusterFromS3 |
+| `rds:snapshot`、`rds:cluster-snapshot` | CreateDBSnapshot、CopyDBSnapshot、CreateDBClusterSnapshot、CopyDBClusterSnapshot |
+| `lambda:function` | CreateFunction（CloudTrail 里的事件名是 CreateFunction20150331） |
+| `elbv2:loadbalancer` | CreateLoadBalancer（ALB、NLB、GWLB；Classic Load Balancer 会记为 `NO_ID`） |
+| `dynamodb:table` | CreateTable、RestoreTableFromBackup、RestoreTableToPointInTime、ImportTable |
+| `efs:file-system` | CreateFileSystem |
+| `elasticache:cluster`、`elasticache:replication-group` | CreateCacheCluster、CreateReplicationGroup |
+| `eks:cluster` | CreateCluster |
+| `s3:bucket` | CreateBucket |
+| `cloudfront:distribution` | CreateDistribution、CreateDistributionWithTags（全局服务，事件只出现在 us-east-1） |
+
+不在表里的资源类型，由每日扫描的第二层（Tagging API 补扫）兜底。
+
+EventBridge 规则的事件模式由代码里的 `EVENTS` 表生成，`make_templates.py` 会把它写进模板。想单独看的话，本地运行：
+
+```bash
+python realtime_tagger.py
+```
+
+### 环境变量
+
+由 StackSet `map-tagger-realtime` 的参数设置，一般不用手动改。
+
+| 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| 全局 | `s3:bucket` | 在桶所在 region 用 Tagging API 追加标签。不用 `PutBucketTagging`，因为它会整体覆盖桶的标签集，也写不回 CloudFormation 留下的 `aws:` 前缀标签 |
-| 全局 | `cloudfront:distribution` | |
+| `MAPPING_PARAM` | 必填 | 账号映射表 SSM 参数的完整 ARN（模板参数 `MappingParameterArn`） |
+| `TAG_KEY` | `map-migrated` | 标签 key（模板参数 `TagKey`） |
+| `MODE` | `dryrun` | `dryrun` 只写日志；`apply` 才真正打标签（模板参数 `Mode`） |
+| `TAG_VALUE` | 无 | 可选。填了就直接用这个值，不查映射表，一般只在单独测试时用 |
+| `OVERWRITE` | `false` | `true` 时覆盖已有的不同值 |
+
+## 每日扫描（sweep_tagger.py）
+
+### 工作原理
+
+同一个 Lambda 函数 `map-daily-sweep` 有两种调用：
+
+1. **调度**：Scheduler 每天 02:00 调用它，事件里没有账号信息。函数从 SSM 参数读出账号映射表，对表里每个账号 assume 进 `MapTaggerRole`，取得已启用的 region（或用环境变量 `REGIONS` 指定），然后按“账号 × region”异步调用自己，每个账号另加一次 `global`。assume 失败的账号记一行 `ERROR`，不发起扫描。
+2. **扫描**：每次调用只处理一个账号的一个 region。先 assume 进该账号的 `MapTaggerRole`，再分两层枚举资源，比较现值，按上面的规则处理。`global` 那次处理 S3 和 CloudFront。
+   - **第一层：服务原生 API。** 能找到从没打过任何标签的资源，覆盖的类型见下表。
+   - **第二层：Resource Groups Tagging API 补扫。** 用 `GetResources` 覆盖第一层没写到的各种类型，但它只返回“当前有标签或曾经打过标签”的资源。第一层处理过的资源会跳过，不重复记录。环境变量 `NO_SWEEP=true` 可以关掉这一层。
+
+拆成这么多次调用，是因为 Lambda 单次调用最长 15 分钟，整个组织放在一次调用里可能跑不完；每次只处理一个 region，大账号也来得及。同时跑多少个，由函数的预留并发控制。
+
+第二层补扫找到的资源可能来自任何服务，所以 `MapTaggerRole` 里放了约 320 个服务的打标签权限。这批权限是用 AWS 策略生成器的服务列表整理出来的（见 `make_templates.py` 的 `SWEEP_TAG_ACTIONS`），去掉了 iam、sts、organizations 这类和费用无关、又涉及权限的服务，并且加了条件：只能写 `map-migrated` 这一个 key。
+
+Payer 自己的资源也通过 `MapTaggerRole` 处理：如果 Payer 里有 MAP 范围内的资源，就在 Payer 里用普通 CloudFormation 栈部署同样的模板，并把 Payer 写进映射表。
+
+### 覆盖的资源类型
+
+| 范围 | 日志里的 type | 说明 |
+| --- | --- | --- |
+| global | `s3:bucket` | 在桶所在 region 用 Tagging API 追加标签。不用 `PutBucketTagging`，因为它会整体覆盖桶的标签集，也写不回 CloudFormation 留下的 `aws:` 前缀标签 |
+| global | `cloudfront:distribution` | |
 | Region | `ec2:instance` | 不含 terminated、shutting-down 状态的实例 |
 | Region | `ec2:volume` | |
 | Region | `ec2:snapshot` | 只含本账号拥有的快照 |
@@ -51,57 +133,56 @@
 | Region | `eks:cluster` | |
 | Region | `<服务名> (sweep)` | 第二层补扫找到的其它类型 |
 
-## 快速开始
+### 账号映射表
 
-需要 Python 3.9+ 和 boto3，并使用**管理账号**的凭证运行（只有管理账号能直接调用 `organizations:ListAccounts`）。脚本调用 STS、Organizations 时用当前凭证配置的默认 region（例如 `AWS_DEFAULT_REGION`），没配置时用 `us-east-1`。
+存在 Payer 的 SSM 参数 `/map-tagger/accounts` 里，是一个 JSON 对象，key 是 12 位账号 ID，value 是这个账号的 MPE 值：
 
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install boto3
+```json
+{
+  "111122223333": "migXXXXXXXXXX",
+  "444455556666": "migYYYYYYYYYY"
+}
 ```
 
-建议按下面的顺序来：
+要用高级参数（Advanced tier），因为只有高级参数能用 RAM 共享给其它账号。高级参数上限 8 KB，大约够两百个账号。
 
-```bash
-# 1) 挑一个账号、一个 region 试跑（dry-run）
-python org_tagger.py --tag-key map-migrated --tag-value migXXXXXXXXXX \
-    --accounts 111122223333 --regions ap-southeast-1 --output test.csv
+### 环境变量
 
-# 2) 全组织 dry-run，审一遍报告
-python org_tagger.py --tag-key map-migrated --tag-value migXXXXXXXXXX
-
-# 3) 确认无误后正式执行
-python org_tagger.py --tag-key map-migrated --tag-value migXXXXXXXXXX --apply
-```
-
-脚本只适合手动跑一两次时这样用。要长期每天补标签，按 [DEPLOY.md](DEPLOY.md) 部署到 Payer 的 EC2 上。
-
-## 参数
-
-| 参数 | 默认值 | 说明 |
+| 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--tag-key` | 必填 | 标签 key，MAP 项目固定为全小写 `map-migrated` |
-| `--tag-value` | 必填 | 标签 value，MAP 项目为 MPE 值（如 `migXXXXXXXXXX`） |
-| `--role-name` | `OrganizationAccountAccessRole` | 成员账号里被 assume 的角色名 |
-| `--accounts` | 全部 ACTIVE 账号 | 只处理这些账号 ID，空格分隔 |
-| `--exclude-accounts` | 无 | 跳过这些账号 ID，空格分隔 |
-| `--regions` | 每个账号已启用的全部 region | 只处理这些 region，空格分隔 |
-| `--no-sweep` | 关 | 不跑第二层 Tagging API 补扫 |
-| `--overwrite` | 关 | 已有同名 key 但值不同时覆盖 |
-| `--apply` | 关 | 真正写标签；不加只做 dry-run |
-| `--workers` | `8` | 并行处理的账号数 |
-| `--output` | `tagging_report.csv` | 报告路径 |
+| `MAPPING_PARAM` | `/map-tagger/accounts` | 账号映射表所在的 SSM 参数名 |
+| `ROLE_NAME` | `MapTaggerRole` | 各账号里被 assume 的角色名 |
+| `TAG_KEY` | `map-migrated` | 标签 key |
+| `MODE` | `dryrun` | `dryrun` 只写日志；`apply` 才真正打标签 |
+| `OVERWRITE` | `false` | `true` 时覆盖已有的不同值 |
+| `REGIONS` | 每个账号已启用的全部 region | 只处理这些 region，逗号分隔，如 `ap-southeast-1,ap-southeast-5,us-east-1` |
+| `NO_SWEEP` | `false` | `true` 时不跑第二层 Tagging API 补扫 |
 
-## 报告
+### 手动测试
 
-报告是 CSV，编码 UTF-8 with BOM，Excel 直接打开中文不乱码。每处理一个资源就写一行，中途中断时已写出的部分也能看。运行结束时日志会打印各 action 的数量。
+在 Lambda 控制台的 Test 页签，用下面的测试事件只扫一个账号的一个 region，结果里会返回各 action 的数量：
 
-| 列 | 说明 |
+```json
+{"account": "111122223333", "region": "ap-southeast-1"}
+```
+
+`region` 填 `global` 处理该账号的 S3 和 CloudFront。测试事件填 `{}` 就是一次完整运行，和 Scheduler 触发的效果一样。
+
+## 日志
+
+两个函数每处理一个资源，都往各自的 CloudWatch 日志组写一行 JSON：
+
+| 函数 | 日志组 |
 | --- | --- |
-| `account_id`、`account_name` | 资源所在账号 |
-| `region` | 资源所在 region；`global` 表示全局资源；`-` 表示账号级错误 |
-| `type` | 资源类型；`ERROR` 行里是出错的处理函数名（如 `h_lambda`）或 `assume_role` |
+| 实时层 | `/aws/lambda/map-realtime-tagger`（在目标 OU 里各账号的各 region） |
+| 每日扫描 | `/aws/lambda/map-daily-sweep`（在 Payer） |
+
+| 字段 | 说明 |
+| --- | --- |
+| `account_id` | 资源所在账号 |
+| `region` | 资源所在 region；`global` 表示全局资源；`-` 表示调度时的账号级错误 |
+| `event` | 只有实时层有：触发的 API |
+| `type` | 资源类型；`ERROR` 行里是出错的环节：处理函数名（如 `h_lambda`）、`assume_role`、`mapping` 或 `invoke` |
 | `resource` | 资源 ID 或 ARN |
 | `current_value` | 该 key 在资源上的现值，没有则为空 |
 | `action` | 见下表 |
@@ -115,12 +196,33 @@ python org_tagger.py --tag-key map-migrated --tag-value migXXXXXXXXXX --apply
 | `CONFLICT` | 已有同名 key 但值不同，没有改动 |
 | `FAILED` | 单个资源打标签失败 |
 | `ERROR` | 整个服务或整个账号出错，例如 assume role 失败、服务在该 region 不可用、被 SCP 拒绝 |
+| `SKIP` | 只有实时层有：事件不在处理范围，或者本账号不在映射表里。规则按事件来源和事件名分别匹配，会混进别的服务的同名事件，例如 ElastiCache 的 CreateSnapshot，属于正常情况 |
+| `NO_ID` | 只有实时层有：事件在处理范围，但没找到资源 ID。`detail` 里附了事件原文，可能是事件格式和预期不同，或者是 Classic Load Balancer |
+| `DISPATCHED` | 只有每日扫描有：调度完成，`detail` 里是账号数和发起的扫描次数 |
 
-每种情况怎么处理，见 [DEPLOY.md 的“审报告”](DEPLOY.md#审报告)。
+在 CloudWatch Logs Insights 里选对应的日志组，用下面的查询看需要关注的记录：
+
+```
+fields @timestamp, account_id, region, action, type, resource, current_value, detail
+| filter ispresent(action) and action not in ["OK", "TAGGED", "SKIP", "DISPATCHED"]
+| sort @timestamp desc
+| limit 10000
+```
+
+按账号和 action 汇总：
+
+```
+filter ispresent(action)
+| stats count(*) as n by account_id, action
+```
+
+每种情况怎么处理，见 [DEPLOY.md 的“审日志”](DEPLOY.md#审日志)。
 
 ## 增加资源类型
 
-某类资源如果从没打过任何标签，又不在第一层的类型里，补扫找不到它。这时可以照现有的 `h_xxx` 函数加一个，再放进 `REGIONAL_HANDLERS`（按 region 跑）或 `GLOBAL_HANDLERS`（每个账号只跑一次）。例如 SNS 主题：
+**实时层**：在 `realtime_tagger.py` 的 `EVENTS` 表里加一行，key 是 `(eventSource, eventName)`，value 是从事件里取出资源 ID 的函数。资源 ID 在响应里的用 `from_resp`，要从请求参数拼 ARN 的用 `from_req`。如果是新服务，还要在 `ADAPTERS` 里加一对读标签、打标签的函数，并把对应权限加进 `make_templates.py` 的 `REALTIME_READ_ACTIONS` 和 `REALTIME_TAG_ACTIONS`。改完后运行 `python make_templates.py`，再按 [DEPLOY.md](DEPLOY.md#5-日常运维与常见问题) 里“更新模板”的方法更新两个 StackSet。
+
+**每日扫描**：某类资源如果从没打过任何标签，又不在第一层的类型里，补扫找不到它。这时可以照现有的 `h_xxx` 函数加一个，再放进 `REGIONAL_HANDLERS`（按 region 跑）或 `GLOBAL_HANDLERS`（每个账号只跑一次）。例如 SNS 主题：
 
 ```python
 def h_sns(ctx):
@@ -132,17 +234,22 @@ def h_sns(ctx):
                   lambda arn=arn: sns.tag_resource(ResourceArn=arn, Tags=ctx.tagset()))
 ```
 
-写的时候注意两点：
+写的时候注意：
 
 - `Res` 的资源 ID 用 ARN，或 ARN 的最后一段（如 EC2 的 `i-xxx`），第二层补扫才能认出它已处理过，不会重复记录。
 - 打标签的 lambda 要用默认参数绑定变量（`lambda arn=arn: ...`），否则循环里所有闭包都会指向最后一个资源。
-
-如果脚本部署在 EC2 上并且要处理 Payer 自己的资源，还要把对应的 List/Describe 和打标签权限加进实例角色的策略，见 [DEPLOY.md](DEPLOY.md#42-创建-ec2-实例角色)。
+- 新加的 List/Describe 权限加进 `make_templates.py` 的 `SWEEP_READ_ACTIONS`（打标签权限一般已在 `SWEEP_TAG_ACTIONS` 里），重新生成模板后更新 StackSet `map-tagger-roles`，再在 Payer 里更新扫描 Lambda 的代码。
 
 ## 限制与注意事项
 
 - 仅供参考，请先在测试账号验证后再用于生产。
 - 只支持 `aws` 标准分区，不含中国区（`aws-cn`）等其它分区。
-- 每个成员账号都要有同名角色。Organizations 新建的账号自带 `OrganizationAccountAccessRole`；邀请加入的账号通常没有，需要由对方管理员建一次，见 [DEPLOY.md](DEPLOY.md#3-成员账号创建角色)。
-- `OrganizationAccountAccessRole` 是管理员权限。能运行这个脚本的身份可以进入所有成员账号，相当于持有全组织的管理员权限，要严格控制谁能使用它。
-- 由 Terraform、CloudFormation 管理的资源，下次部署时可能把脚本打的标签抹掉，要同步把标签写进 IaC 代码。
+- 依赖 Organizations 的全部功能：服务托管的 StackSets 和 RAM 共享给组织都需要它。
+- 实时层依赖 CloudTrail：账号里要有一条正在记录管理事件的 trail，否则 EventBridge 收不到 API 事件，实时层完全不工作。
+- 实时层按 region 部署：没部署的 region 里创建的资源，只能等每日扫描。CloudFront 的事件只出现在 us-east-1，所以 us-east-1 一定要部署。
+- StackSets 的自动部署不认账号过滤，只能按 OU 或整个组织部署。目标 OU 里的非 MAP 账号也会有两个角色和实时层 Lambda，只是不在映射表里所以只空转；不能放这些资源的账号，不要放在目标 OU 里。
+- 服务托管的 StackSets 不会部署到管理账号，Payer 自己的资源要用普通 CloudFormation 栈单独部署。
+- 两个函数和模板都只在本地测试过：函数用模拟事件和接口校验，模板用 cfn-lint，都没有在真实账号里部署运行过。实时层的事件解析是按 CloudTrail 的事件格式写的，上线前按 DEPLOY.md 用测试资源确认，日志里出现 `NO_ID` 说明格式和预期不同。
+- `MapTaggerRole` 第二层的打标签权限是按 AWS 策略生成器当时的服务列表整理的。以后 AWS 新增的服务不在列表里，遇到 AccessDenied 时再补。
+- 实时层只是缩短空档。最可靠的仍然是创建资源时就带上标签：启动模板、Terraform 的 `default_tags`、Auto Scaling 组的 `PropagateAtLaunch=true` 等。
+- 由 Terraform、CloudFormation 管理的资源，下次部署时可能把打上的标签抹掉，要同步把标签写进 IaC 代码。

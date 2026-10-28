@@ -1,9 +1,5 @@
-# 运行产生的报告（含账号 ID 和资源 ARN）
+# 从 CloudWatch Logs Insights 导出的结果（含账号 ID 和资源 ARN）
 *.csv
-reports/
-
-# 运行配置（MPE 值、排除的账号 ID 等），只放在 EC2 上
-.env
 
 # Python
 __pycache__/

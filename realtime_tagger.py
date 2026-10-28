@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+"""
+realtime_tagger.py
+
+由 StackSets 部署到目标 OU 里每个账号、每个 region 的 Lambda 函数，资源一创建就补标签：
+  资源创建 API → CloudTrail → EventBridge 规则 → 本函数
+  → 从事件里取出新资源 → 缺少指定标签就补上。
+
+账单按小时计、标签不追溯，只靠每天的 sweep_tagger.py 扫描，资源创建到被补上标签之间的消费没有标签。
+本函数让新资源几分钟内带上标签；漏掉的（事件丢失、未覆盖的 API、资源创建中拒绝打标签等）
+仍由 sweep_tagger.py 每天兜底。
+
+标签值从 Payer 用 RAM 共享过来的账号映射表里查（和 sweep_tagger.py 读的是同一个 SSM 参数），
+本账号不在表里就只记一行 SKIP，所以目标 OU 里的非 MAP 账号也可以放心部署。映射表缓存 5 分钟。
+
+环境变量：
+  MAPPING_PARAM  账号映射表 SSM 参数的完整 ARN，如 arn:aws:ssm:ap-southeast-1:123456789012:parameter/map-tagger/accounts
+  TAG_KEY        标签 key，默认 map-migrated
+  TAG_VALUE      可选；填了就直接用这个值，不查映射表
+  MODE           dryrun（默认，只写日志）或 apply（真正打标签）
+  OVERWRITE      true 时覆盖已有的不同值；默认 false，记为 CONFLICT
+
+每处理一个资源，往 CloudWatch Logs 写一行 JSON，字段和 action 含义与 sweep_tagger.py 一致。
+
+本地运行 `python realtime_tagger.py` 会打印 EventBridge 规则的事件模式。
+它由下面的 EVENTS 表生成；make_templates.py 也从这里取代码和事件模式生成 StackSets 模板。
+
+说明：
+  - 仅供参考，请先在测试账号用 MODE=dryrun 验证后再改成 apply。
+  - 只支持 aws 标准分区，不含中国区（aws-cn）。
+"""
+import json
+import os
+import time
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError, WaiterError
+
+BOTO_CFG = Config(retries={"max_attempts": 10, "mode": "adaptive"})
+MAPPING_PARAM = os.environ.get("MAPPING_PARAM", "")
+TAG_KEY = os.environ.get("TAG_KEY", "map-migrated")
+TAG_VALUE = os.environ.get("TAG_VALUE", "")
+APPLY = os.environ.get("MODE", "dryrun").lower() == "apply"
+OVERWRITE = os.environ.get("OVERWRITE", "false").lower() == "true"
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+MAPPING_TTL = 300
+# 权限类错误重试也没用，直接记 FAILED
+NO_RETRY = {"AccessDenied", "AccessDeniedException", "UnauthorizedOperation", "UnauthorizedException"}
+
+_clients = {}
+_mapping = {"at": 0.0, "value": {}}
+
+
+# ----------------------------------------------------------------------------
+# 基础工具
+# ----------------------------------------------------------------------------
+
+def client(service, region=None):
+    r = region or REGION
+    if (service, r) not in _clients:
+        _clients[(service, r)] = boto3.client(service, region_name=r, config=BOTO_CFG)
+    return _clients[(service, r)]
+
+
+def tdict(tags):
+    """[{'Key':..,'Value':..}] -> {key: value}"""
+    return {t["Key"]: t.get("Value", "") for t in (tags or [])}
+
+
+def tagset(value):
+    return [{"Key": TAG_KEY, "Value": value}]
+
+
+def tagdict(value):
+    return {TAG_KEY: value}
+
+
+def log(**fields):
+    print(json.dumps(fields, ensure_ascii=False, default=str))
+
+
+def find(obj, key):
+    """在嵌套的 dict/list 里递归找名为 key 的字段（不区分大小写），返回所有字符串值。
+    各 API 的 responseElements 层级不一，按字段名找比写死路径稳。"""
+    key = key.lower()
+    out = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k.lower() == key:
+                out += [x for x in (v if isinstance(v, list) else [v]) if isinstance(x, str)]
+            else:
+                out += find(v, key)
+    elif isinstance(obj, list):
+        for v in obj:
+            out += find(v, key)
+    return out
+
+
+def load_mapping():
+    """读账号映射表 {"账号ID": "MPE 值"}，缓存 MAPPING_TTL 秒。
+    共享参数要用完整 ARN 读，并且要到参数所在的 region 去读。"""
+    if time.time() - _mapping["at"] < MAPPING_TTL:
+        return _mapping["value"]
+    region = MAPPING_PARAM.split(":")[3] if MAPPING_PARAM.startswith("arn:") else REGION
+    value = client("ssm", region).get_parameter(Name=MAPPING_PARAM)["Parameter"]["Value"]
+    mapping = json.loads(value)
+    if not isinstance(mapping, dict):
+        raise ValueError(f'{MAPPING_PARAM} 应该是 {{"账号ID": "MPE 值"}} 格式的 JSON 对象')
+    _mapping.update(at=time.time(), value={str(k).strip(): str(v).strip() for k, v in mapping.items()})
+    return _mapping["value"]
+
+
+def tag_value_for(account):
+    """本账号该打的标签值；不在映射表里返回 None。"""
+    if TAG_VALUE:
+        return TAG_VALUE
+    if not MAPPING_PARAM:
+        raise RuntimeError("没有设置环境变量 MAPPING_PARAM（或 TAG_VALUE）")
+    return load_mapping().get(account)
+
+
+# ----------------------------------------------------------------------------
+# 读现有标签 / 打标签：每类资源一对函数，参数是资源 ID 或 ARN（打标签时再加标签值）
+# ----------------------------------------------------------------------------
+
+def ec2_get(rid):
+    resp = client("ec2").describe_tags(Filters=[{"Name": "resource-id", "Values": [rid]}])
+    return tdict(resp.get("Tags"))
+
+
+def ec2_tag(rid, value):
+    client("ec2").create_tags(Resources=[rid], Tags=tagset(value))
+
+
+def rds_get(arn):
+    return tdict(client("rds").list_tags_for_resource(ResourceName=arn).get("TagList"))
+
+
+def rds_tag(arn, value):
+    client("rds").add_tags_to_resource(ResourceName=arn, Tags=tagset(value))
+
+
+def lambda_get(arn):
+    return client("lambda").list_tags(Resource=arn).get("Tags", {}) or {}
+
+
+def lambda_tag(arn, value):
+    client("lambda").tag_resource(Resource=arn, Tags=tagdict(value))
+
+
+def elbv2_get(arn):
+    tds = client("elbv2").describe_tags(ResourceArns=[arn])["TagDescriptions"]
+    return tdict(tds[0].get("Tags")) if tds else {}
+
+
+def elbv2_tag(arn, value):
+    client("elbv2").add_tags(ResourceArns=[arn], Tags=tagset(value))
+
+
+def dynamodb_get(arn):
+    ddb, tags, kwargs = client("dynamodb"), [], {"ResourceArn": arn}
+    while True:
+        resp = ddb.list_tags_of_resource(**kwargs)
+        tags += resp.get("Tags", [])
+        if not resp.get("NextToken"):
+            return tdict(tags)
+        kwargs["NextToken"] = resp["NextToken"]
+
+
+def dynamodb_tag(arn, value):
+    client("dynamodb").tag_resource(ResourceArn=arn, Tags=tagset(value))
+
+
+def efs_get(fid):
+    fs = client("efs").describe_file_systems(FileSystemId=fid)["FileSystems"]
+    return tdict(fs[0].get("Tags")) if fs else {}
+
+
+def efs_tag(fid, value):
+    client("efs").tag_resource(ResourceId=fid, Tags=tagset(value))
+
+
+def elasticache_get(arn):
+    return tdict(client("elasticache").list_tags_for_resource(ResourceName=arn).get("TagList"))
+
+
+def elasticache_tag(arn, value):
+    client("elasticache").add_tags_to_resource(ResourceName=arn, Tags=tagset(value))
+
+
+def eks_get(arn):
+    return client("eks").list_tags_for_resource(resourceArn=arn).get("tags", {}) or {}
+
+
+def eks_tag(arn, value):
+    client("eks").tag_resource(resourceArn=arn, tags=tagdict(value))
+
+
+def bucket_region(arn):
+    name = arn.split(":::")[1]
+    loc = client("s3").get_bucket_location(Bucket=name).get("LocationConstraint") or "us-east-1"
+    return name, "eu-west-1" if loc == "EU" else loc
+
+
+def s3_get(arn):
+    name, loc = bucket_region(arn)
+    try:
+        return tdict(client("s3", loc).get_bucket_tagging(Bucket=name)["TagSet"])
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "NoSuchTagSet":
+            raise
+        return {}
+
+
+def s3_tag(arn, value):
+    # 和 sweep_tagger.py 一样用 Tagging API 追加，不用会整体覆盖标签集的 PutBucketTagging
+    _, loc = bucket_region(arn)
+    resp = client("resourcegroupstaggingapi", loc).tag_resources(ResourceARNList=[arn], Tags=tagdict(value))
+    failed = resp.get("FailedResourcesMap") or {}
+    if failed:
+        raise RuntimeError("; ".join(
+            f"{a}: {v.get('ErrorCode')} {v.get('ErrorMessage')}" for a, v in failed.items()))
+
+
+def cloudfront_get(arn):
+    tags = client("cloudfront", "us-east-1").list_tags_for_resource(Resource=arn)["Tags"]
+    return tdict(tags.get("Items"))
+
+
+def cloudfront_tag(arn, value):
+    client("cloudfront", "us-east-1").tag_resource(Resource=arn, Tags={"Items": tagset(value)})
+
+
+ADAPTERS = {
+    "ec2": (ec2_get, ec2_tag),
+    "rds": (rds_get, rds_tag),
+    "lambda": (lambda_get, lambda_tag),
+    "elbv2": (elbv2_get, elbv2_tag),
+    "dynamodb": (dynamodb_get, dynamodb_tag),
+    "efs": (efs_get, efs_tag),
+    "elasticache": (elasticache_get, elasticache_tag),
+    "eks": (eks_get, eks_tag),
+    "s3": (s3_get, s3_tag),
+    "cloudfront": (cloudfront_get, cloudfront_tag),
+}
+
+
+# ----------------------------------------------------------------------------
+# 事件 → 资源
+# EVENTS 的 key 是 (eventSource, eventName)，value 是从事件 detail 里取出
+# [(适配器, 资源类型, 资源 ID 或 ARN)] 的函数。资源类型和 sweep_tagger.py 日志里的 type 一致。
+# 想覆盖更多 API，照着格式加一行，再运行 make_templates.py 重新生成模板、更新 StackSet。
+# ----------------------------------------------------------------------------
+
+def from_resp(kind, rtype, key):
+    """资源 ID 或 ARN 在 responseElements 里。"""
+    return lambda d: [(kind, rtype, v) for v in find(d.get("responseElements"), key)]
+
+
+def from_req(kind, rtype, key, arn_fmt, lower=False):
+    """资源名在 requestParameters 顶层，按格式拼出 ARN。"""
+    def extract(d):
+        v = (d.get("requestParameters") or {}).get(key)
+        if not isinstance(v, str):
+            return []
+        return [(kind, rtype, arn_fmt.format(region=d["awsRegion"], account=d["recipientAccountId"],
+                                             v=v.lower() if lower else v))]
+    return extract
+
+
+def lambda_function(d):
+    # 发布了版本时 ARN 末尾带 :版本号，去掉，标签打在函数本身上
+    return [("lambda", "lambda:function", ":".join(a.split(":")[:7]))
+            for a in find(d.get("responseElements"), "functionArn")]
+
+
+def elasticache_replication_group(d):
+    # ElastiCache 会把 ID 转成小写。复制组本身之外，响应里列出的成员节点也打上
+    # （sweep_tagger.py 是按节点扫描的）
+    out = from_req("elasticache", "elasticache:replication-group", "replicationGroupId",
+                   "arn:aws:elasticache:{region}:{account}:replicationgroup:{v}", lower=True)(d)
+    for c in find(d.get("responseElements"), "memberClusters"):
+        out.append(("elasticache", "elasticache:cluster",
+                    f"arn:aws:elasticache:{d['awsRegion']}:{d['recipientAccountId']}:cluster:{c}"))
+    return out
+
+
+def cloudfront_distribution(d):
+    did = ((d.get("responseElements") or {}).get("distribution") or {}).get("id")
+    if not did:
+        return []
+    return [("cloudfront", "cloudfront:distribution",
+             f"arn:aws:cloudfront::{d['recipientAccountId']}:distribution/{did}")]
+
+
+EC2 = "ec2.amazonaws.com"
+RDS = "rds.amazonaws.com"
+DDB = "dynamodb.amazonaws.com"
+
+EVENTS = {
+    (EC2, "RunInstances"): from_resp("ec2", "ec2:instance", "instanceId"),
+    (EC2, "CreateVolume"): from_resp("ec2", "ec2:volume", "volumeId"),
+    (EC2, "CreateSnapshot"): from_resp("ec2", "ec2:snapshot", "snapshotId"),
+    (EC2, "CreateSnapshots"): from_resp("ec2", "ec2:snapshot", "snapshotId"),
+    (EC2, "CopySnapshot"): from_resp("ec2", "ec2:snapshot", "snapshotId"),
+    (EC2, "CreateImage"): from_resp("ec2", "ec2:image", "imageId"),
+    (EC2, "CopyImage"): from_resp("ec2", "ec2:image", "imageId"),
+    (EC2, "RegisterImage"): from_resp("ec2", "ec2:image", "imageId"),
+    (EC2, "AllocateAddress"): from_resp("ec2", "ec2:elastic-ip", "allocationId"),
+    (EC2, "CreateNatGateway"): from_resp("ec2", "ec2:natgateway", "natGatewayId"),
+    (EC2, "CreateVpcEndpoint"): from_resp("ec2", "ec2:vpc-endpoint", "vpcEndpointId"),
+
+    (RDS, "CreateDBInstance"): from_resp("rds", "rds:db", "dBInstanceArn"),
+    (RDS, "CreateDBInstanceReadReplica"): from_resp("rds", "rds:db", "dBInstanceArn"),
+    (RDS, "RestoreDBInstanceFromDBSnapshot"): from_resp("rds", "rds:db", "dBInstanceArn"),
+    (RDS, "RestoreDBInstanceToPointInTime"): from_resp("rds", "rds:db", "dBInstanceArn"),
+    (RDS, "RestoreDBInstanceFromS3"): from_resp("rds", "rds:db", "dBInstanceArn"),
+    (RDS, "CreateDBCluster"): from_resp("rds", "rds:cluster", "dBClusterArn"),
+    (RDS, "RestoreDBClusterFromSnapshot"): from_resp("rds", "rds:cluster", "dBClusterArn"),
+    (RDS, "RestoreDBClusterToPointInTime"): from_resp("rds", "rds:cluster", "dBClusterArn"),
+    (RDS, "RestoreDBClusterFromS3"): from_resp("rds", "rds:cluster", "dBClusterArn"),
+    (RDS, "CreateDBSnapshot"): from_resp("rds", "rds:snapshot", "dBSnapshotArn"),
+    (RDS, "CopyDBSnapshot"): from_resp("rds", "rds:snapshot", "dBSnapshotArn"),
+    (RDS, "CreateDBClusterSnapshot"): from_resp("rds", "rds:cluster-snapshot", "dBClusterSnapshotArn"),
+    (RDS, "CopyDBClusterSnapshot"): from_resp("rds", "rds:cluster-snapshot", "dBClusterSnapshotArn"),
+
+    ("lambda.amazonaws.com", "CreateFunction20150331"): lambda_function,
+    # 经典负载均衡器（CLB）的响应里没有 loadBalancerArn，会记为 NO_ID
+    ("elasticloadbalancing.amazonaws.com", "CreateLoadBalancer"):
+        from_resp("elbv2", "elbv2:loadbalancer", "loadBalancerArn"),
+
+    (DDB, "CreateTable"): from_resp("dynamodb", "dynamodb:table", "tableArn"),
+    (DDB, "RestoreTableFromBackup"): from_resp("dynamodb", "dynamodb:table", "tableArn"),
+    (DDB, "RestoreTableToPointInTime"): from_resp("dynamodb", "dynamodb:table", "tableArn"),
+    (DDB, "ImportTable"): from_resp("dynamodb", "dynamodb:table", "tableArn"),
+
+    ("elasticfilesystem.amazonaws.com", "CreateFileSystem"):
+        from_resp("efs", "efs:file-system", "fileSystemId"),
+    ("elasticache.amazonaws.com", "CreateCacheCluster"):
+        from_req("elasticache", "elasticache:cluster", "cacheClusterId",
+                 "arn:aws:elasticache:{region}:{account}:cluster:{v}", lower=True),
+    ("elasticache.amazonaws.com", "CreateReplicationGroup"): elasticache_replication_group,
+    ("eks.amazonaws.com", "CreateCluster"):
+        from_req("eks", "eks:cluster", "name", "arn:aws:eks:{region}:{account}:cluster/{v}"),
+    ("s3.amazonaws.com", "CreateBucket"):
+        from_req("s3", "s3:bucket", "bucketName", "arn:aws:s3:::{v}"),
+    # CloudFront 是全局服务，事件只出现在 us-east-1
+    ("cloudfront.amazonaws.com", "CreateDistribution"): cloudfront_distribution,
+    ("cloudfront.amazonaws.com", "CreateDistributionWithTags"): cloudfront_distribution,
+}
+
+
+def event_pattern():
+    """EventBridge 规则的事件模式，由 EVENTS 生成。"""
+    return {
+        "detail-type": ["AWS API Call via CloudTrail"],
+        "detail": {
+            "eventSource": sorted({s for s, _ in EVENTS}),
+            "eventName": sorted({n for _, n in EVENTS}),
+            "errorCode": [{"exists": False}],   # 调用失败的不处理
+        },
+    }
+
+
+# ----------------------------------------------------------------------------
+# 主流程
+# ----------------------------------------------------------------------------
+
+def with_retry(fn, attempts=6, delay=10):
+    """资源刚创建时可能还在 creating 状态，有的服务会拒绝读写标签，隔一会儿重试。"""
+    for i in range(attempts):
+        try:
+            return fn()
+        except ClientError as e:
+            if i == attempts - 1 or e.response["Error"]["Code"] in NO_RETRY:
+                raise
+            time.sleep(delay)
+
+
+def launch_volumes(instance_ids):
+    """RunInstances 时随实例一起创建的 EBS 卷没有单独的 CreateVolume 事件。
+    等实例进入 running（卷都已挂上），再从 BlockDeviceMappings 里找出来。"""
+    ec2 = client("ec2")
+    try:
+        ec2.get_waiter("instance_running").wait(
+            InstanceIds=instance_ids, WaiterConfig={"Delay": 5, "MaxAttempts": 30})
+    except WaiterError:
+        pass   # 有实例启动失败或已终止也没关系，能找到几个卷算几个
+    vols = []
+    for r in ec2.describe_instances(InstanceIds=instance_ids)["Reservations"]:
+        for i in r["Instances"]:
+            vols += [m["Ebs"]["VolumeId"] for m in i.get("BlockDeviceMappings", []) if "Ebs" in m]
+    return vols
+
+
+def process(kind, rtype, rid, value, base):
+    get_tags, apply_tag = ADAPTERS[kind]
+
+    def once():
+        cur = get_tags(rid).get(TAG_KEY)
+        if cur == value:
+            return cur, "OK", ""
+        if cur is not None and not OVERWRITE:
+            return cur, "CONFLICT", "已有同名 key 但值不同；OVERWRITE=true 才覆盖"
+        if not APPLY:
+            return cur, "WOULD_TAG", ""
+        apply_tag(rid, value)
+        return cur, "TAGGED", ""
+
+    try:
+        cur, action, detail = with_retry(once)
+    except Exception as e:  # noqa: BLE001
+        cur, action, detail = None, "FAILED", str(e)[:500]
+    log(**base, type=rtype, resource=rid, current_value=cur or "", action=action, detail=detail)
+    return action
+
+
+def lambda_handler(event, context):
+    d = dict(event.get("detail") or {})
+    d.setdefault("awsRegion", event.get("region") or REGION)
+    d.setdefault("recipientAccountId", event.get("account"))
+    source, name = d.get("eventSource"), d.get("eventName")
+    base = {"account_id": d["recipientAccountId"], "region": d["awsRegion"], "event": name}
+
+    extract = EVENTS.get((source, name))
+    if d.get("errorCode") or not extract:
+        # 规则按 eventSource 和 eventName 分别匹配，会混进别的服务的同名事件，
+        # 例如 ElastiCache 的 CreateSnapshot
+        log(**base, action="SKIP", detail=f"{source} {name} 不在处理范围或调用失败")
+        return {"processed": 0}
+
+    value = tag_value_for(d["recipientAccountId"])
+    if not value:
+        log(**base, action="SKIP", detail="本账号不在账号映射表里")
+        return {"processed": 0}
+
+    targets = list(dict.fromkeys(extract(d)))   # 去重，保持顺序
+    if not targets:
+        raw = {k: d.get(k) for k in ("requestParameters", "responseElements")}
+        log(**base, action="NO_ID",
+            detail="事件里没找到资源 ID，可能是事件格式和预期不同：" + json.dumps(raw, default=str)[:1500])
+        return {"processed": 0}
+
+    actions = [process(kind, rtype, rid, value, base) for kind, rtype, rid in targets]
+    if name == "RunInstances":
+        try:
+            vols = launch_volumes([rid for _, _, rid in targets])
+        except Exception as e:  # noqa: BLE001
+            log(**base, type="ec2:volume", resource="", current_value="", action="ERROR", detail=str(e)[:500])
+            actions.append("ERROR")
+        else:
+            actions += [process("ec2", "ec2:volume", v, value, base) for v in vols]
+
+    bad = [a for a in actions if a in ("FAILED", "ERROR")]
+    if bad:
+        # 抛异常让 Lambda 的 Errors 指标能报警；EventBridge 是异步调用 Lambda，默认还会自动重试两次
+        raise RuntimeError(f"{len(bad)} 个资源处理失败，详见上面的日志")
+    return {"processed": len(actions)}
+
+
+if __name__ == "__main__":
+    # 打印 EventBridge 规则的事件模式
+    print(json.dumps(event_pattern(), indent=2))

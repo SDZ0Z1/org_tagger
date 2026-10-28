@@ -1,34 +1,42 @@
 #!/usr/bin/env python3
 """
-org_tagger.py
+sweep_tagger.py
 
-在 AWS Organizations 管理账号（Payer）上运行：
-  列出组织内所有 ACTIVE 账号 → assume role 进每个账号 → 按 region 枚举资源
-  → 给缺少指定标签的资源补上标签 → 输出 CSV 报告。
+部署在 Payer（管理账号）的 Lambda 函数，每天由 EventBridge Scheduler 触发一次，
+给 MAP 白名单账号里缺少标签的资源补上，兜住实时层（realtime_tagger.py）漏掉的。
 
-默认 dry-run（只出报告，不改任何东西）；确认报告无误后加 --apply 才真正写标签。
+白名单和每个账号的标签值来自 SSM 参数里的账号映射表，例如：
+  {"111122223333": "migXXXXXXXXXX", "444455556666": "migYYYYYYYYYY"}
+不在表里的账号不处理。
 
-示例：
-  # 1) 挑一个账号、一个 region 试跑
-  python org_tagger.py --tag-key map-migrated --tag-value migXXXXXXXXXX \
-      --accounts 111122223333 --regions ap-southeast-1
+一次运行由同一个函数的两种调用组成：
+  调度：Scheduler 触发，事件里没有 account。读出映射表，确认每个账号能 assume 进 MapTaggerRole、
+        取得已启用的 region，再按“账号 × region”异步调用本函数自己，另外每个账号调用一次 global。
+  扫描：事件里有 account 和 region。assume 进该账号的 MapTaggerRole，枚举这个 region 的资源，
+        缺标签的补上；region 为 global 时处理 S3 和 CloudFront。
+拆开是因为 Lambda 单次调用最长 15 分钟，整个组织放在一次调用里可能跑不完。
 
-  # 2) 全组织 dry-run
-  python org_tagger.py --tag-key map-migrated --tag-value migXXXXXXXXXX
+环境变量：
+  MAPPING_PARAM  映射表所在的 SSM 参数名，默认 /map-tagger/accounts
+  ROLE_NAME      各账号里被 assume 的角色名，默认 MapTaggerRole
+  TAG_KEY        标签 key，默认 map-migrated
+  MODE           dryrun（默认，只写日志）或 apply（真正打标签）
+  OVERWRITE      true 时覆盖已有的不同值；默认 false，记为 CONFLICT
+  REGIONS        只处理这些 region，逗号分隔；默认每个账号已启用的全部 region
+  NO_SWEEP       true 时不跑第二层 Tagging API 补扫，只处理第一层列出的类型
 
-  # 3) 审完报告后执行
-  python org_tagger.py --tag-key map-migrated --tag-value migXXXXXXXXXX --apply
+每处理一个资源，往 CloudWatch Logs 写一行 JSON，字段和 realtime_tagger.py 一致。
+
+在控制台测试单个账号、单个 region，用这样的测试事件：
+  {"account": "111122223333", "region": "ap-southeast-1"}
 
 说明：
-  - 仅供参考，请先在测试账号验证后再用于生产。
+  - 仅供参考，请先用 MODE=dryrun 验证后再改成 apply。
   - 只支持 aws 标准分区，不含中国区（aws-cn）。
-  - 管理账号自身用当前凭证处理；成员账号通过 --role-name 指定的角色进入。
+  - Payer 自己的资源也要扫描时，在 Payer 里同样建 MapTaggerRole，并把 Payer 写进映射表。
 """
-import argparse
-import csv
-import logging
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
+import os
 from dataclasses import dataclass
 from typing import Callable, Dict
 
@@ -37,8 +45,14 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 BOTO_CFG = Config(retries={"max_attempts": 10, "mode": "adaptive"})
-HOME_REGION = boto3.Session().region_name or "us-east-1"
-log = logging.getLogger("org_tagger")
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+MAPPING_PARAM = os.environ.get("MAPPING_PARAM", "/map-tagger/accounts")
+ROLE_NAME = os.environ.get("ROLE_NAME", "MapTaggerRole")
+TAG_KEY = os.environ.get("TAG_KEY", "map-migrated")
+APPLY = os.environ.get("MODE", "dryrun").lower() == "apply"
+OVERWRITE = os.environ.get("OVERWRITE", "false").lower() == "true"
+REGIONS = [r.strip() for r in os.environ.get("REGIONS", "").split(",") if r.strip()]
+NO_SWEEP = os.environ.get("NO_SWEEP", "false").lower() == "true"
 
 
 # ----------------------------------------------------------------------------
@@ -47,7 +61,7 @@ log = logging.getLogger("org_tagger")
 
 @dataclass
 class Res:
-    rtype: str                      # 报告里显示的资源类型，如 ec2:instance
+    rtype: str                      # 日志里显示的资源类型，如 ec2:instance
     rid: str                        # 资源 ID 或 ARN
     tags: Dict[str, str]            # 现有标签
     apply: Callable[[], None]       # 执行打标签的函数
@@ -73,7 +87,7 @@ def arn_tail(arn):
 
 
 def rgt_tag(rgt, arns, tags):
-    """用 Resource Groups Tagging API 打标签；部分失败时抛异常，让报告记成 FAILED。"""
+    """用 Resource Groups Tagging API 打标签；部分失败时抛异常，让日志记成 FAILED。"""
     resp = rgt.tag_resources(ResourceARNList=arns, Tags=tags)
     failed = resp.get("FailedResourcesMap") or {}
     if failed:
@@ -81,8 +95,12 @@ def rgt_tag(rgt, arns, tags):
             f"{a}: {v.get('ErrorCode')} {v.get('ErrorMessage')}" for a, v in failed.items()))
 
 
+def log(**fields):
+    print(json.dumps(fields, ensure_ascii=False, default=str))
+
+
 class Ctx:
-    """一个账号 + 一个 region 的上下文，缓存 client。只在单线程里使用。"""
+    """一个账号 + 一个 region 的上下文，缓存 client。"""
 
     def __init__(self, sess, region, key, value):
         self.sess, self.region, self.key, self.value = sess, region, key, value
@@ -101,15 +119,12 @@ class Ctx:
         return {self.key: self.value}
 
 
-def get_session(account_id, mgmt_id, role_name):
-    """管理账号直接用当前凭证；成员账号 assume role。
-    每个 region 都重新取一次凭证，避免长时间运行时 1 小时凭证过期。"""
-    if account_id == mgmt_id:
-        return boto3.Session()
-    sts = boto3.Session().client("sts", region_name=HOME_REGION, config=BOTO_CFG)
+def get_session(account_id):
+    """assume 进该账号的 MapTaggerRole。Payer 自己也走这条路，权限和成员账号一致。"""
+    sts = boto3.client("sts", region_name=REGION, config=BOTO_CFG)
     c = sts.assume_role(
-        RoleArn=f"arn:aws:iam::{account_id}:role/{role_name}",
-        RoleSessionName="org-tagger",
+        RoleArn=f"arn:aws:iam::{account_id}:role/{ROLE_NAME}",
+        RoleSessionName="map-daily-sweep",
     )["Credentials"]
     return boto3.Session(
         aws_access_key_id=c["AccessKeyId"],
@@ -310,6 +325,8 @@ def h_sweep(ctx):
     for m in paginate(rgt, "get_resources", "ResourceTagMappingList"):
         arn = m["ResourceARN"]
         svc = arn.split(":")[2]
+        if svc in ("s3", "cloudfront"):
+            continue   # 由 global 那次调用处理
         yield Res(f"{svc} (sweep)", arn, tdict(m.get("Tags")),
                   lambda arn=arn: rgt_tag(rgt, [arn], ctx.tagdict()), from_sweep=True)
 
@@ -324,149 +341,111 @@ REGIONAL_HANDLERS = [
 
 
 # ----------------------------------------------------------------------------
-# 报告
-# ----------------------------------------------------------------------------
-
-class Report:
-    FIELDS = ["account_id", "account_name", "region", "type", "resource",
-              "current_value", "action", "detail"]
-
-    def __init__(self, path):
-        # utf-8-sig：Excel 直接打开中文不乱码
-        self.f = open(path, "w", newline="", encoding="utf-8-sig")
-        self.w = csv.writer(self.f)
-        self.w.writerow(self.FIELDS)
-        self.lock = threading.Lock()
-        self.counts = {}
-
-    def row(self, account_id, account_name, region, rtype, resource,
-            current_value, action, detail=""):
-        with self.lock:
-            self.w.writerow([account_id, account_name, region, rtype, resource,
-                             current_value or "", action, detail])
-            self.f.flush()
-            self.counts[action] = self.counts.get(action, 0) + 1
-
-    def close(self):
-        self.f.close()
-
-
-# ----------------------------------------------------------------------------
 # 主流程
 # ----------------------------------------------------------------------------
 
-def list_accounts(org):
-    out = []
-    for a in paginate(org, "list_accounts", "Accounts"):
-        state = a.get("State") or a.get("Status")   # 新字段 State，旧字段 Status
-        if state == "ACTIVE":
-            out.append((a["Id"], a.get("Name", "")))
-    return out
+def load_mapping():
+    """读 SSM 里的账号映射表：{"账号ID": "MPE 值"}。"""
+    value = boto3.client("ssm", region_name=REGION, config=BOTO_CFG).get_parameter(
+        Name=MAPPING_PARAM)["Parameter"]["Value"]
+    mapping = json.loads(value)
+    if not isinstance(mapping, dict):
+        raise ValueError(f'{MAPPING_PARAM} 应该是 {{"账号ID": "MPE 值"}} 格式的 JSON 对象')
+    return {str(k).strip(): str(v).strip() for k, v in mapping.items()}
 
 
 def enabled_regions(sess):
-    ec2 = sess.client("ec2", region_name=HOME_REGION, config=BOTO_CFG)
+    ec2 = sess.client("ec2", region_name=REGION, config=BOTO_CFG)
     # 不带 AllRegions 参数时，只返回这个账号已启用的 region
     return sorted(r["RegionName"] for r in ec2.describe_regions()["Regions"])
 
 
-def process_account(acct_id, acct_name, mgmt_id, args, report):
-    seen = set()   # 去重：第一层处理过的资源，第二层补扫时跳过
-
-    def run(handlers, region, region_label):
+def dispatch(function_name):
+    """调度：按“账号 × region”异步调用本函数，每个账号另加一次 global。"""
+    mapping = load_mapping()
+    lam = boto3.client("lambda", region_name=REGION, config=BOTO_CFG)
+    jobs = 0
+    for acct, tag_value in mapping.items():
+        base = {"account_id": acct, "region": "-", "resource": "", "current_value": ""}
+        if not (acct.isdigit() and len(acct) == 12 and tag_value):
+            log(**base, type="mapping", action="ERROR", detail="映射表里的账号 ID 或 MPE 值不对")
+            continue
         try:
-            sess = get_session(acct_id, mgmt_id, args.role_name)
+            regions = REGIONS or enabled_regions(get_session(acct))
         except Exception as e:  # noqa: BLE001
-            # 中途重新 assume 失败（限流、角色被改等），记下来，跳过这个 region 继续跑
-            report.row(acct_id, acct_name, region_label, "assume_role", "", "", "ERROR", str(e)[:500])
-            return
-        ctx = Ctx(sess, region, args.tag_key, args.tag_value)
-        for h in handlers:
+            # 多半是该账号没有 MapTaggerRole，或角色信任的不是本函数的执行角色
+            log(**base, type="assume_role", action="ERROR", detail=str(e)[:500])
+            continue
+        for region in ["global"] + regions:
             try:
-                for res in h(ctx):
-                    if res.rid in seen or (res.from_sweep and arn_tail(res.rid) in seen):
-                        continue
-                    seen.add(res.rid)
-                    cur = res.tags.get(args.tag_key)
-                    base = (acct_id, acct_name, region_label, res.rtype, res.rid, cur)
-                    if cur == args.tag_value:
-                        report.row(*base, "OK")
-                    elif cur is not None and not args.overwrite:
-                        report.row(*base, "CONFLICT", "已有同名 key 但值不同；加 --overwrite 才覆盖")
-                    elif not args.apply:
-                        report.row(*base, "WOULD_TAG")
-                    else:
-                        try:
-                            res.apply()
-                            report.row(*base, "TAGGED")
-                        except Exception as e:  # noqa: BLE001
-                            report.row(*base, "FAILED", str(e)[:500])
+                lam.invoke(FunctionName=function_name, InvocationType="Event",
+                           Payload=json.dumps({"account": acct, "region": region, "tag_value": tag_value}))
+                jobs += 1
             except Exception as e:  # noqa: BLE001
-                # 某个服务在该 region 不可用 / 没权限 / 被 SCP 拒绝，记下来继续跑
-                report.row(acct_id, acct_name, region_label, h.__name__, "", "", "ERROR", str(e)[:500])
+                log(**dict(base, region=region), type="invoke", action="ERROR", detail=str(e)[:500])
+    log(action="DISPATCHED", mode="apply" if APPLY else "dryrun",
+        detail=f"{len(mapping)} 个账号，{jobs} 次扫描调用")
+    return {"accounts": len(mapping), "jobs": jobs}
+
+
+def scan(acct, region, tag_value):
+    """扫描：处理一个账号的一个 region（或 global），返回各 action 的数量。"""
+    counts = {}
+
+    def row(rtype, resource, current_value, action, detail=""):
+        log(account_id=acct, region=region, type=rtype, resource=resource,
+            current_value=current_value or "", action=action, detail=detail)
+        counts[action] = counts.get(action, 0) + 1
 
     try:
-        sess = get_session(acct_id, mgmt_id, args.role_name)
-        regions = args.regions or enabled_regions(sess)
+        sess = get_session(acct)
     except Exception as e:  # noqa: BLE001
-        report.row(acct_id, acct_name, "-", "assume_role", "", "", "ERROR", str(e)[:500])
-        return
+        row("assume_role", "", "", "ERROR", str(e)[:500])
+        return counts
 
-    run(GLOBAL_HANDLERS, "us-east-1", "global")
-    regional = REGIONAL_HANDLERS + ([] if args.no_sweep else [h_sweep])
-    for region in regions:
-        log.info("[%s] %s", acct_id, region)
-        run(regional, region, region)
+    if region == "global":
+        ctx, handlers = Ctx(sess, "us-east-1", TAG_KEY, tag_value), GLOBAL_HANDLERS
+    else:
+        ctx = Ctx(sess, region, TAG_KEY, tag_value)
+        handlers = REGIONAL_HANDLERS + ([] if NO_SWEEP else [h_sweep])
 
-
-def main():
-    p = argparse.ArgumentParser(description="从 Organizations 管理账号给全组织资源补标签")
-    p.add_argument("--tag-key", required=True)
-    p.add_argument("--tag-value", required=True)
-    p.add_argument("--role-name", default="OrganizationAccountAccessRole",
-                   help="成员账号里被 assume 的角色名（默认 OrganizationAccountAccessRole）")
-    p.add_argument("--accounts", nargs="*", help="只处理这些账号 ID（默认全部 ACTIVE 账号）")
-    p.add_argument("--exclude-accounts", nargs="*", default=[], help="跳过这些账号 ID")
-    p.add_argument("--regions", nargs="*", help="只处理这些 region（默认每个账号已启用的全部 region）")
-    p.add_argument("--no-sweep", action="store_true", help="不跑 Tagging API 补扫，只处理第一层列出的类型")
-    p.add_argument("--overwrite", action="store_true", help="已有同名 key 但值不同时覆盖")
-    p.add_argument("--apply", action="store_true", help="真正打标签；不加则只 dry-run")
-    p.add_argument("--workers", type=int, default=8, help="并行处理的账号数")
-    p.add_argument("--output", default="tagging_report.csv")
-    args = p.parse_args()
-
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    logging.getLogger("botocore").setLevel(logging.WARNING)
-
-    base = boto3.Session()
-    mgmt_id = base.client("sts", region_name=HOME_REGION).get_caller_identity()["Account"]
-    org = base.client("organizations", region_name=HOME_REGION, config=BOTO_CFG)
-
-    accounts = list_accounts(org)
-    if args.accounts:
-        wanted = set(args.accounts)
-        accounts = [a for a in accounts if a[0] in wanted]
-    excluded = set(args.exclude_accounts)
-    accounts = [a for a in accounts if a[0] not in excluded]
-
-    log.info("模式: %s | 标签: %s=%s | 账号数: %d",
-             "APPLY" if args.apply else "DRY-RUN", args.tag_key, args.tag_value, len(accounts))
-
-    report = Report(args.output)
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(process_account, aid, name, mgmt_id, args, report): aid
-                for aid, name in accounts}
-        for f in as_completed(futs):
-            aid = futs[f]
-            try:
-                f.result()
-                log.info("完成账号 %s", aid)
-            except Exception as e:  # noqa: BLE001
-                log.error("账号 %s 异常: %s", aid, e)
-    report.close()
-    log.info("统计: %s", report.counts)
-    log.info("报告已写入: %s", args.output)
+    seen = set()   # 去重：第一层处理过的资源，第二层补扫时跳过
+    for h in handlers:
+        try:
+            for res in h(ctx):
+                if res.rid in seen or (res.from_sweep and arn_tail(res.rid) in seen):
+                    continue
+                seen.add(res.rid)
+                cur = res.tags.get(TAG_KEY)
+                if cur == tag_value:
+                    row(res.rtype, res.rid, cur, "OK")
+                elif cur is not None and not OVERWRITE:
+                    row(res.rtype, res.rid, cur, "CONFLICT", "已有同名 key 但值不同；OVERWRITE=true 才覆盖")
+                elif not APPLY:
+                    row(res.rtype, res.rid, cur, "WOULD_TAG")
+                else:
+                    try:
+                        res.apply()
+                        row(res.rtype, res.rid, cur, "TAGGED")
+                    except Exception as e:  # noqa: BLE001
+                        row(res.rtype, res.rid, cur, "FAILED", str(e)[:500])
+        except Exception as e:  # noqa: BLE001
+            # 某个服务在该 region 不可用 / 没权限 / 被 SCP 拒绝，记下来继续跑
+            row(h.__name__, "", "", "ERROR", str(e)[:500])
+    return counts
 
 
-if __name__ == "__main__":
-    main()
+def lambda_handler(event, context):
+    event = event if isinstance(event, dict) else {}
+    acct = event.get("account")
+    if not acct:
+        return dispatch(context.function_name)
+
+    region = event.get("region")
+    if not region:
+        raise ValueError('扫描调用要带 region，例如 {"account": "111122223333", "region": "ap-southeast-1"}')
+    tag_value = event.get("tag_value") or load_mapping().get(acct)
+    if not tag_value:
+        raise ValueError(f"账号 {acct} 不在映射表 {MAPPING_PARAM} 里")
+    counts = scan(acct, region, tag_value)
+    return {"account": acct, "region": region, "mode": "apply" if APPLY else "dryrun", "counts": counts}
