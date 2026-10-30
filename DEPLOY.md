@@ -515,9 +515,22 @@ fields account_id, region, type, resource, current_value, action, detail
 | 每日扫描没有运行 | 看 Scheduler 里 `map-daily-sweep` 的状态是不是 Enabled；Logs Insights 里当天有没有 `DISPATCHED` 那一行；Lambda Monitor 页签里有没有 Errors |
 | 扫描很久才跑完 | 预留并发限制了同时运行的数量，排队的调用会自动等待，最多等 6 小时。账号多时可以把预留并发调大一些 |
 | 实时层：新资源过了 10 分钟还没标签 | 依次检查：`map-tagger-realtime` 的 `Mode` 是不是 `apply`；该账号该 region 的实时层日志里有没有这个资源，是不是 `SKIP`（账号被排除）；资源所在的 region 有没有部署实时层；资源类型在不在实时层的覆盖范围（见 [README](README.md#覆盖的-api)），不在就等每日扫描。规则一直不触发的排查方法见 [3.5](#35-用测试资源验证) |
-| 实时层日志出现 `NO_ID` | 事件格式和代码预期的不同，或者是 Classic Load Balancer（属正常）。把这行日志的 `detail`（里面附了事件原文）交给维护代码的人对照修改 `EVENTS`。这个资源会由每日扫描补上 |
+| 实时层日志出现 `NO_ID` | 事件格式和代码预期的不同。把这行日志的 `detail`（里面附了事件原文）交给维护代码的人对照修改 `EVENTS`。这个资源会由每日扫描补上 |
 | 实时层日志出现 `FAILED` | `detail` 含 AccessDenied 多半是 SCP 拒绝。其它错误多半是资源还在创建中、服务暂时拒绝打标签，每日扫描会补上 |
 | StackSet 部署失败 | 在 StackSet 的 Stack instances 页签看 Status reason；新账号自动部署的结果在 Operations 页签里。常见原因：同名资源已存在（先删掉手动建的）、SCP 拒绝、该账号没启用这个 region、`map-tagger-roles` 还没部署好就部署了 `map-tagger-realtime`（3.4 的依赖没设） |
 | 更新模板（实时层代码、事件模式或权限有变化） | 在本地运行 `python make_templates.py` 重新生成模板。按 [3.9](#39-修改-stackset) 修改对应的 StackSet，选 Replace current template 上传新模板。Payer 里的实时层用 3.7 的循环重新部署 |
 | 更新扫描代码 | 在 Payer 打开 `map-daily-sweep`，把新版 `sweep_tagger.py` 的全部内容粘贴进 `lambda_function.py`，点 Deploy |
 | 停用 | 每日扫描：在 Scheduler 里把 `map-daily-sweep` 设为 Disabled。实时层：把 `map-tagger-realtime` 的 `Mode` 改回 `dryrun` 即可暂停；彻底停用就删除两个 StackSet 的全部 stack 实例，再删除 StackSet 本身 |
+
+### 升级到新版
+
+仓库里的代码或模板有更新时（例如新增了覆盖的服务），按下面的顺序更新已经部署的环境。先更新权限，再更新用到这些权限的代码：
+
+1. 在本地运行 `python make_templates.py`，确认 `templates/` 下的模板是最新的。
+2. **成员账号的角色**：按 [3.9](#39-修改-stackset) 修改 `map-tagger-roles`，选 Replace current template，上传新的 `templates/map-tagger-roles.yaml`，参数不变。等 Operations 页签里这次操作完成。
+3. **成员账号的实时层**：同样修改 `map-tagger-realtime`，上传新的 `templates/map-tagger-realtime.yaml`，参数（包括 `Mode`）不变。新模板会同时更新 Lambda 的代码和 EventBridge 规则的事件模式。
+4. **Payer 的角色**（如果按 3.7 部署了）：在 CloudFormation → Stacks 选 `map-tagger-roles`，点 Update，选 Replace existing template 上传新模板，参数不变，勾选 IAM 确认后提交。
+5. **Payer 的实时层**：把新的 `map-tagger-realtime.yaml` 上传到 CloudShell 覆盖旧文件，再跑一次 3.7 的循环。`Mode` 要填现在用的值，已经切到 apply 的就写 `Mode=apply`。
+6. **扫描 Lambda**：把新版 `sweep_tagger.py` 的全部内容粘贴进 `map-daily-sweep` 的 `lambda_function.py`，点 Deploy。
+
+更新期间实时层照常运行。新增的资源类型从更新完成后开始实时打标签，已有的资源由下一次每日扫描补上。

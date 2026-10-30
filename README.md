@@ -65,15 +65,28 @@ python make_templates.py
 | `rds:cluster` | CreateDBCluster、RestoreDBClusterFromSnapshot、RestoreDBClusterToPointInTime、RestoreDBClusterFromS3 |
 | `rds:snapshot`、`rds:cluster-snapshot` | CreateDBSnapshot、CopyDBSnapshot、CreateDBClusterSnapshot、CopyDBClusterSnapshot |
 | `lambda:function` | CreateFunction（CloudTrail 里的事件名是 CreateFunction20150331） |
-| `elbv2:loadbalancer` | CreateLoadBalancer（ALB、NLB、GWLB；Classic Load Balancer 会记为 `NO_ID`） |
+| `elbv2:loadbalancer`、`elb:loadbalancer` | CreateLoadBalancer（ALB、NLB、GWLB 记为 `elbv2:loadbalancer`；Classic Load Balancer 记为 `elb:loadbalancer`） |
 | `dynamodb:table` | CreateTable、RestoreTableFromBackup、RestoreTableToPointInTime、ImportTable |
 | `efs:file-system` | CreateFileSystem |
 | `elasticache:cluster`、`elasticache:replication-group` | CreateCacheCluster、CreateReplicationGroup |
 | `eks:cluster` | CreateCluster |
 | `s3:bucket` | CreateBucket |
 | `cloudfront:distribution` | CreateDistribution、CreateDistributionWithTags（全局服务，事件只出现在 us-east-1） |
+| `sqs:queue` | CreateQueue |
+| `sns:topic` | CreateTopic |
+| `kms:key` | CreateKey |
+| `dms:replication-instance`、`dms:replication-config` | CreateReplicationInstance、CreateReplicationConfig（DMS Serverless） |
+| `kafka:cluster` | CreateCluster、CreateClusterV2（MSK，含 Serverless） |
+| `route53:hostedzone`、`route53:healthcheck` | CreateHostedZone、CreateHealthCheck（全局服务，事件只出现在 us-east-1） |
+| `route53resolver:resolver-endpoint`、`route53resolver:resolver-rule` | CreateResolverEndpoint、CreateResolverRule |
+| `workspaces:workspace` | CreateWorkspaces |
+| `memorydb:cluster` | CreateCluster（MemoryDB） |
+| `mq:broker` | CreateBroker |
+| `docdb-elastic:cluster` | CreateCluster（DocumentDB Elastic Clusters） |
+| `ds:directory` | CreateDirectory、CreateMicrosoftAD、ConnectDirectory |
+| `es:domain` | CreateDomain、CreateElasticsearchDomain（OpenSearch Service） |
 
-不在表里的资源类型，由每日扫描的第二层（Tagging API 补扫）兜底。
+普通的 Amazon DocumentDB 和 Neptune 走的是 RDS 的 API，已包含在 `rds:db`、`rds:cluster` 里。不在表里的资源类型，由每日扫描的第二层（Tagging API 补扫）兜底。
 
 EventBridge 规则的事件模式由代码里的 `EVENTS` 表生成，`make_templates.py` 会把它写进模板。想单独看的话，本地运行：
 
@@ -100,9 +113,9 @@ python realtime_tagger.py
 同一个 Lambda 函数 `map-daily-sweep` 有两种调用：
 
 1. **调度**：Scheduler 每天 02:00 调用它，事件里没有账号信息。函数从 SSM 参数读出账号映射表；表里有 `"*"` 时，从 Organizations 列出所有 ACTIVE 成员账号（不含 Payer），再加上表里单独写的账号，去掉值为空的。然后对每个账号 assume 进 `MapTaggerRole`，取得已启用的 region（或用环境变量 `REGIONS` 指定），然后按“账号 × region”异步调用自己，每个账号另加一次 `global`。assume 失败的账号记一行 `ERROR`，不发起扫描。
-2. **扫描**：每次调用只处理一个账号的一个 region。先 assume 进该账号的 `MapTaggerRole`，再分两层枚举资源，比较现值，按上面的规则处理。`global` 那次处理 S3 和 CloudFront。
+2. **扫描**：每次调用只处理一个账号的一个 region。先 assume 进该账号的 `MapTaggerRole`，再分两层枚举资源，比较现值，按上面的规则处理。`global` 那次处理 S3、CloudFront 和 Route 53。某个服务没在这个 region 上线（接口域名解析不了）时直接跳过，不记 `ERROR`。
    - **第一层：服务原生 API。** 能找到从没打过任何标签的资源，覆盖的类型见下表。
-   - **第二层：Resource Groups Tagging API 补扫。** 用 `GetResources` 覆盖第一层没写到的各种类型，但它只返回“当前有标签或曾经打过标签”的资源。第一层处理过的资源会跳过，不重复记录。环境变量 `NO_SWEEP=true` 可以关掉这一层。
+   - **第二层：Resource Groups Tagging API 补扫。** 用 `GetResources` 覆盖第一层没写到的各种类型，但它只返回“当前有标签或曾经打过标签”的资源。第一层处理过的资源会跳过，不重复记录；S3、CloudFront、Route 53 由 `global` 那次处理，这里也跳过。CloudFormation 栈也会跳过：栈本身不产生费用，经 Tagging API 给栈打标签会走一次栈更新，把标签传到栈里所有资源，StackSets 管理的栈还会和 StackSet 对不上。环境变量 `NO_SWEEP=true` 可以关掉这一层。
 
 拆成这么多次调用，是因为 Lambda 单次调用最长 15 分钟，整个组织放在一次调用里可能跑不完；每次只处理一个 region，大账号也来得及。同时跑多少个，由函数的预留并发控制。
 
@@ -116,6 +129,7 @@ Payer 自己的资源也通过 `MapTaggerRole` 处理，但 `"*"` 不包括 Paye
 | --- | --- | --- |
 | global | `s3:bucket` | 在桶所在 region 用 Tagging API 追加标签。不用 `PutBucketTagging`，因为它会整体覆盖桶的标签集，也写不回 CloudFormation 留下的 `aws:` 前缀标签 |
 | global | `cloudfront:distribution` | |
+| global | `route53:hostedzone`、`route53:healthcheck` | |
 | Region | `ec2:instance` | 不含 terminated、shutting-down 状态的实例 |
 | Region | `ec2:volume` | |
 | Region | `ec2:snapshot` | 只含本账号拥有的快照 |
@@ -126,11 +140,24 @@ Payer 自己的资源也通过 `MapTaggerRole` 处理，但 `"*"` 不包括 Paye
 | Region | `rds:db`、`rds:cluster` | |
 | Region | `rds:snapshot`、`rds:cluster-snapshot` | 只含手动快照 |
 | Region | `lambda:function` | |
-| Region | `elbv2:loadbalancer` | ALB、NLB、GWLB；不含 Classic Load Balancer |
+| Region | `elbv2:loadbalancer` | ALB、NLB、GWLB |
+| Region | `elb:loadbalancer` | Classic Load Balancer |
 | Region | `dynamodb:table` | |
 | Region | `efs:file-system` | |
 | Region | `elasticache:cluster` | |
 | Region | `eks:cluster` | |
+| Region | `sqs:queue` | |
+| Region | `sns:topic` | |
+| Region | `kms:key` | 只含客户托管的密钥；AWS 托管的密钥不能打标签，等待删除、等待导入的也跳过 |
+| Region | `dms:replication-instance`、`dms:replication-config` | 复制实例和 DMS Serverless 复制配置 |
+| Region | `kafka:cluster` | MSK，含 Serverless |
+| Region | `route53resolver:resolver-endpoint`、`route53resolver:resolver-rule` | 规则不含 AWS 自带的和别的账号共享过来的 |
+| Region | `workspaces:workspace` | 不含 terminating、terminated 状态 |
+| Region | `memorydb:cluster` | |
+| Region | `mq:broker` | |
+| Region | `docdb-elastic:cluster` | DocumentDB Elastic Clusters；普通 DocumentDB 包含在 `rds:cluster` 里 |
+| Region | `ds:directory` | 不含别的账号共享过来的目录 |
+| Region | `es:domain` | OpenSearch Service 域，不含已删除的 |
 | Region | `<服务名> (sweep)` | 第二层补扫找到的其它类型 |
 
 ### 账号映射表
@@ -206,7 +233,7 @@ Payer 自己的资源也通过 `MapTaggerRole` 处理，但 `"*"` 不包括 Paye
 | `FAILED` | 单个资源打标签失败 |
 | `ERROR` | 整个服务或整个账号出错，例如 assume role 失败、服务在该 region 不可用、被 SCP 拒绝 |
 | `SKIP` | 只有实时层有：事件不在处理范围，或者本账号在映射表里被排除。规则按事件来源和事件名分别匹配，会混进别的服务的同名事件，例如 ElastiCache 的 CreateSnapshot，属于正常情况 |
-| `NO_ID` | 只有实时层有：事件在处理范围，但没找到资源 ID。`detail` 里附了事件原文，可能是事件格式和预期不同，或者是 Classic Load Balancer |
+| `NO_ID` | 只有实时层有：事件在处理范围，但没找到资源 ID。`detail` 里附了事件原文，多半是事件格式和预期不同 |
 | `DISPATCHED` | 只有每日扫描有：调度完成，`detail` 里是账号数和发起的扫描次数 |
 
 在 CloudWatch Logs Insights 里选对应的日志组，用下面的查询看需要关注的记录：
@@ -259,7 +286,7 @@ def h_sns(ctx):
 - 映射表的 RAM 共享是按 region 的，要建在参数所在的 region，否则实时层读映射表会报 AccessDeniedException。
 - StackSets 部署到整个组织，被排除的账号里也会有两个角色和实时层 Lambda，只是空转。连这些资源都不能放的账号，要把部署目标改成按 OU 并避开它们所在的 OU（StackSets 的自动部署不认账号过滤，没法按账号排除）。
 - 服务托管的 StackSets 不会部署到管理账号，Payer 自己的资源要用普通 CloudFormation 栈单独部署。
-- 已在真实组织里部署并验证：StackSets 下发、实时层用 CreateVolume 走通了完整链路、每日扫描跑通了全量 dry-run。实时层其它 API 的事件解析是按 CloudTrail 的事件格式写的，只用模拟事件测试过；日志里出现 `NO_ID` 说明格式和预期不同。
+- 已在真实组织里部署并验证：StackSets 下发、实时层用 CreateVolume 走通了完整链路、每日扫描跑通了全量 dry-run。实时层其它 API 的事件解析是按 CloudTrail 的事件格式写的，只用模拟事件测试过；日志里出现 `NO_ID` 说明格式和预期不同。SQS、SNS、KMS 等后来新增的服务，两层都只用模拟数据和 botocore 的接口校验测试过，还没在真实账号里跑过。
 - 每日扫描连不上某个 region（例如那个 region 本身出问题）时，那里会记 `ERROR`，那次扫描调用还会一直等到 15 分钟上限被强制结束，不影响其它 region。
 - `MapTaggerRole` 第二层的打标签权限是按 AWS 策略生成器当时的服务列表整理的。以后 AWS 新增的服务不在列表里，遇到 AccessDenied 时再补。
 - 实时层只是缩短空档。最可靠的仍然是创建资源时就带上标签：启动模板、Terraform 的 `default_tags`、Auto Scaling 组的 `PropagateAtLaunch=true` 等。

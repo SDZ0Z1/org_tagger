@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "templates"
 SWEEP_ROLE = "MapSweepLambdaRole"      # Payer 里扫描 Lambda 的执行角色，MapTaggerRole 只信任它
 INLINE_POLICY_LIMIT = 10240            # 一个角色的内联策略加起来的字符上限（不算空白）
+EVENT_PATTERN_LIMIT = 4096             # EventBridge 规则事件模式的字符上限
 
 
 # ----------------------------------------------------------------------------
@@ -47,6 +48,18 @@ SWEEP_READ_ACTIONS = [
     "eks:ListClusters", "eks:DescribeCluster",
     "s3:ListAllMyBuckets", "s3:GetBucketLocation", "s3:GetBucketTagging",
     "cloudfront:ListDistributions", "cloudfront:ListTagsForResource",
+    "sqs:ListQueues", "sqs:ListQueueTags", "sns:ListTopics", "sns:ListTagsForResource",
+    "kms:ListKeys", "kms:DescribeKey", "kms:ListResourceTags",
+    "dms:DescribeReplicationInstances", "dms:DescribeReplicationConfigs", "dms:ListTagsForResource",
+    "kafka:ListClustersV2", "kafka:ListTagsForResource",
+    "route53:ListHostedZones", "route53:ListHealthChecks", "route53:ListTagsForResource",
+    "route53resolver:ListResolverEndpoints", "route53resolver:ListResolverRules",
+    "route53resolver:ListTagsForResource",
+    "workspaces:DescribeWorkspaces", "workspaces:DescribeTags",
+    "memorydb:DescribeClusters", "memorydb:ListTags", "mq:ListBrokers", "mq:ListTags",
+    "docdb-elastic:ListClusters", "docdb-elastic:ListTagsForResource",
+    "ds:DescribeDirectories", "ds:ListTagsForResource",
+    "es:ListDomainNames", "es:DescribeDomains", "es:ListTags",
 ]
 
 # MapTaggerRole：第一层各类型的打标签权限。
@@ -81,7 +94,7 @@ SWEEP_TAG_ACTIONS = [
     "cloudtrail:AddTags", "cloudwatch:Tag*", "codeartifact:Tag*", "codecatalyst:Tag*",
     "codecommit:Tag*", "codeconnections:Tag*", "codedeploy:Tag*",
     "codedeploy:AddTagsToOnPremisesInstances", "codeguru-profiler:Tag*", "codeguru-reviewer:Tag*",
-    "codeguru-security:Tag*", "codepipeline:Tag*", "codestar:Tag*", "codestar-connections:Tag*",
+    "codeguru-security:Tag*", "codepipeline:Tag*", "codestar-connections:Tag*",
     "codestar-notifications:Tag*", "codewhisperer:Tag*", "cognito-identity:Tag*",
     "cognito-idp:Tag*", "comprehend:Tag*", "config:Tag*", "connect:Tag*", "connect-campaigns:Tag*",
     "controltower:Tag*", "cur:Tag*", "databrew:Tag*", "dataexchange:Tag*", "datapipeline:AddTags",
@@ -154,6 +167,10 @@ REALTIME_READ_ACTIONS = [
     "eks:ListTagsForResource",
     "s3:GetBucketLocation", "s3:GetBucketTagging",
     "cloudfront:ListTagsForResource",
+    "sqs:ListQueueTags", "sns:ListTagsForResource", "kms:ListResourceTags", "dms:ListTagsForResource",
+    "kafka:ListTagsForResource", "route53:ListTagsForResource", "route53resolver:ListTagsForResource",
+    "workspaces:DescribeTags", "memorydb:ListTags", "mq:ListTags", "docdb-elastic:ListTagsForResource",
+    "ds:ListTagsForResource", "es:ListTags",
 ]
 REALTIME_TAG_ACTIONS = [
     "ec2:CreateTags", "rds:AddTagsToResource", "lambda:TagResource",
@@ -161,6 +178,10 @@ REALTIME_TAG_ACTIONS = [
     "elasticfilesystem:TagResource", "elasticache:AddTagsToResource",
     "eks:TagResource", "s3:PutBucketTagging", "tag:TagResources",
     "cloudfront:TagResource",
+    "sqs:TagQueue", "sns:TagResource", "kms:TagResource", "dms:AddTagsToResource",
+    "kafka:TagResource", "route53:ChangeTagsForResource", "route53resolver:TagResource",
+    "workspaces:CreateTags", "memorydb:TagResource", "mq:CreateTags", "docdb-elastic:TagResource",
+    "ds:AddTagsToResource", "es:AddTags",
 ]
 
 
@@ -344,12 +365,16 @@ def main():
     size = len(json.dumps(MAP_TAGGER_POLICY, separators=(",", ":")).replace('{"Ref":"TagKey"}', '"map-migrated"'))
     if size > INLINE_POLICY_LIMIT:
         raise SystemExit(f"MapTagger 策略 {size} 字符，超过 IAM 内联策略上限 {INLINE_POLICY_LIMIT}")
+    pattern = len(json.dumps(realtime_tagger.event_pattern(), separators=(",", ":")))
+    if pattern > EVENT_PATTERN_LIMIT:
+        raise SystemExit(f"事件模式 {pattern} 字符，超过 EventBridge 上限 {EVENT_PATTERN_LIMIT}")
     OUT.mkdir(exist_ok=True)
     write("map-tagger-roles.yaml", ROLES_TEMPLATE,
           "StackSet map-tagger-roles：部署到整个组织并自动部署，每个账号只部署到一个 region")
     write("map-tagger-realtime.yaml", REALTIME_TEMPLATE,
           "StackSet map-tagger-realtime：部署到整个组织并自动部署，每个账号部署到每个用到的 region（含 us-east-1）")
-    print(f"MapTagger 策略 {size} / {INLINE_POLICY_LIMIT} 字符，第二层补扫覆盖 {len(SWEEP_TAG_ACTIONS)} 条打标签权限")
+    print(f"MapTagger 策略 {size} / {INLINE_POLICY_LIMIT} 字符，第二层补扫覆盖 {len(SWEEP_TAG_ACTIONS)} 条打标签权限；"
+          f"事件模式 {pattern} / {EVENT_PATTERN_LIMIT} 字符")
 
 
 if __name__ == "__main__":

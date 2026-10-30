@@ -39,8 +39,10 @@ Payer 自己只有在表里单独写一行时才处理。
 """
 import json
 import os
+import socket
 from dataclasses import dataclass
 from typing import Callable, Dict
+from urllib.parse import urlparse
 
 import boto3
 from botocore.config import Config
@@ -101,6 +103,10 @@ def log(**fields):
     print(json.dumps(fields, ensure_ascii=False, default=str))
 
 
+class ServiceUnavailable(Exception):
+    """这个服务在该 region 没有接口（服务没在这个 region 上线）。"""
+
+
 class Ctx:
     """一个账号 + 一个 region 的上下文，缓存 client。"""
 
@@ -111,7 +117,17 @@ class Ctx:
     def client(self, service, region=None):
         r = region or self.region
         if (service, r) not in self._clients:
-            self._clients[(service, r)] = self.sess.client(service, region_name=r, config=BOTO_CFG)
+            c = self.sess.client(service, region_name=r, config=BOTO_CFG)
+            # 服务没在这个 region 上线时接口域名解析不了；先查一下，免得 botocore 反复重试连接。
+            # 解析失败在本地是 gaierror，在 Lambda 里可能是 [Errno 16] Device or resource busy，所以接 OSError。
+            # botocore 自带的数据也认为这个 region 有该服务时，多半是 DNS 临时出错，照常报错
+            try:
+                socket.getaddrinfo(urlparse(c.meta.endpoint_url).hostname, 443)
+            except OSError:
+                if r in self.sess.get_available_regions(service):
+                    raise
+                raise ServiceUnavailable(f"{service} 在 {r} 没有接口")
+            self._clients[(service, r)] = c
         return self._clients[(service, r)]
 
     def tagset(self):
@@ -280,6 +296,147 @@ def h_eks(ctx):
                   lambda arn=arn: eks.tag_resource(resourceArn=arn, tags=ctx.tagdict()))
 
 
+def h_elb_classic(ctx):
+    elb = ctx.client("elb")
+    names = [lb["LoadBalancerName"] for lb in paginate(elb, "describe_load_balancers", "LoadBalancerDescriptions")]
+    for i in range(0, len(names), 20):
+        for td in elb.describe_tags(LoadBalancerNames=names[i:i + 20])["TagDescriptions"]:
+            name = td["LoadBalancerName"]
+            yield Res("elb:loadbalancer", name, tdict(td.get("Tags")),
+                      lambda name=name: elb.add_tags(LoadBalancerNames=[name], Tags=ctx.tagset()))
+
+
+def h_sqs(ctx):
+    sqs = ctx.client("sqs")
+    for url in paginate(sqs, "list_queues", "QueueUrls"):
+        acct, name = url.rstrip("/").split("/")[-2:]
+        tags = sqs.list_queue_tags(QueueUrl=url).get("Tags", {}) or {}
+        yield Res("sqs:queue", f"arn:aws:sqs:{ctx.region}:{acct}:{name}", tags,
+                  lambda url=url: sqs.tag_queue(QueueUrl=url, Tags=ctx.tagdict()))
+
+
+def h_sns(ctx):
+    sns = ctx.client("sns")
+    for t in paginate(sns, "list_topics", "Topics"):
+        arn = t["TopicArn"]
+        tags = tdict(sns.list_tags_for_resource(ResourceArn=arn).get("Tags"))
+        yield Res("sns:topic", arn, tags,
+                  lambda arn=arn: sns.tag_resource(ResourceArn=arn, Tags=ctx.tagset()))
+
+
+def h_kms(ctx):
+    kms = ctx.client("kms")
+    for k in paginate(kms, "list_keys", "Keys"):
+        kid = k["KeyId"]
+        md = kms.describe_key(KeyId=kid)["KeyMetadata"]
+        # AWS 托管的密钥不能打标签；等待删除、等待导入的也跳过
+        if md.get("KeyManager") != "CUSTOMER" or str(md.get("KeyState", "")).startswith("Pending"):
+            continue
+        tags = {t["TagKey"]: t.get("TagValue", "") for t in paginate(kms, "list_resource_tags", "Tags", KeyId=kid)}
+        yield Res("kms:key", md["Arn"], tags,
+                  lambda kid=kid: kms.tag_resource(KeyId=kid, Tags=[{"TagKey": ctx.key, "TagValue": ctx.value}]))
+
+
+def h_dms(ctx):
+    dms = ctx.client("dms")
+    for r in paginate(dms, "describe_replication_instances", "ReplicationInstances"):
+        arn = r["ReplicationInstanceArn"]
+        yield Res("dms:replication-instance", arn, tdict(dms.list_tags_for_resource(ResourceArn=arn).get("TagList")),
+                  lambda arn=arn: dms.add_tags_to_resource(ResourceArn=arn, Tags=ctx.tagset()))
+
+
+def h_dms_serverless(ctx):
+    dms = ctx.client("dms")
+    kwargs = {}
+    while True:   # 这个 API 没有分页器，按 Marker 自己翻页
+        resp = dms.describe_replication_configs(**kwargs)
+        for c in resp.get("ReplicationConfigs", []) or []:
+            arn = c["ReplicationConfigArn"]
+            yield Res("dms:replication-config", arn, tdict(dms.list_tags_for_resource(ResourceArn=arn).get("TagList")),
+                      lambda arn=arn: dms.add_tags_to_resource(ResourceArn=arn, Tags=ctx.tagset()))
+        if not resp.get("Marker"):
+            return
+        kwargs["Marker"] = resp["Marker"]
+
+
+def h_kafka(ctx):
+    kafka = ctx.client("kafka")
+    for c in paginate(kafka, "list_clusters_v2", "ClusterInfoList"):
+        arn = c["ClusterArn"]
+        tags = kafka.list_tags_for_resource(ResourceArn=arn).get("Tags", {}) or {}
+        yield Res("kafka:cluster", arn, tags,
+                  lambda arn=arn: kafka.tag_resource(ResourceArn=arn, Tags=ctx.tagdict()))
+
+
+def h_route53_resolver(ctx):
+    rr = ctx.client("route53resolver")
+    items = [("route53resolver:resolver-endpoint", e["Arn"])
+             for e in paginate(rr, "list_resolver_endpoints", "ResolverEndpoints")]
+    # 跳过 AWS 自带的规则和别的账号共享过来的规则
+    items += [("route53resolver:resolver-rule", r["Arn"])
+              for r in paginate(rr, "list_resolver_rules", "ResolverRules")
+              if str(r.get("OwnerId", "")).isdigit() and r.get("ShareStatus") != "SHARED_WITH_ME"]
+    for rtype, arn in items:
+        tags = tdict(paginate(rr, "list_tags_for_resource", "Tags", ResourceArn=arn))
+        yield Res(rtype, arn, tags, lambda arn=arn: rr.tag_resource(ResourceArn=arn, Tags=ctx.tagset()))
+
+
+def h_workspaces(ctx):
+    ws = ctx.client("workspaces")
+    for w in paginate(ws, "describe_workspaces", "Workspaces"):
+        if w.get("State") in ("TERMINATING", "TERMINATED"):
+            continue
+        wid = w["WorkspaceId"]
+        yield Res("workspaces:workspace", wid, tdict(ws.describe_tags(ResourceId=wid).get("TagList")),
+                  lambda wid=wid: ws.create_tags(ResourceId=wid, Tags=ctx.tagset()))
+
+
+def h_memorydb(ctx):
+    mdb = ctx.client("memorydb")
+    for c in paginate(mdb, "describe_clusters", "Clusters"):
+        arn = c["ARN"]
+        yield Res("memorydb:cluster", arn, tdict(mdb.list_tags(ResourceArn=arn).get("TagList")),
+                  lambda arn=arn: mdb.tag_resource(ResourceArn=arn, Tags=ctx.tagset()))
+
+
+def h_mq(ctx):
+    mq = ctx.client("mq")
+    for b in paginate(mq, "list_brokers", "BrokerSummaries"):
+        arn = b["BrokerArn"]
+        yield Res("mq:broker", arn, mq.list_tags(ResourceArn=arn).get("Tags", {}) or {},
+                  lambda arn=arn: mq.create_tags(ResourceArn=arn, Tags=ctx.tagdict()))
+
+
+def h_docdb_elastic(ctx):
+    de = ctx.client("docdb-elastic")
+    for c in paginate(de, "list_clusters", "clusters"):
+        arn = c["clusterArn"]
+        yield Res("docdb-elastic:cluster", arn, de.list_tags_for_resource(resourceArn=arn).get("tags", {}) or {},
+                  lambda arn=arn: de.tag_resource(resourceArn=arn, tags=ctx.tagdict()))
+
+
+def h_ds(ctx):
+    ds = ctx.client("ds")
+    for d in paginate(ds, "describe_directories", "DirectoryDescriptions"):
+        if "OwnerDirectoryDescription" in d:
+            continue   # 别的账号共享过来的目录
+        did = d["DirectoryId"]
+        yield Res("ds:directory", did, tdict(paginate(ds, "list_tags_for_resource", "Tags", ResourceId=did)),
+                  lambda did=did: ds.add_tags_to_resource(ResourceId=did, Tags=ctx.tagset()))
+
+
+def h_opensearch(ctx):
+    os_ = ctx.client("opensearch")
+    names = [d["DomainName"] for d in os_.list_domain_names().get("DomainNames", [])]
+    for i in range(0, len(names), 5):   # DescribeDomains 一次最多 5 个
+        for s in os_.describe_domains(DomainNames=names[i:i + 5])["DomainStatusList"]:
+            if s.get("Deleted"):
+                continue
+            arn = s["ARN"]
+            yield Res("es:domain", arn, tdict(os_.list_tags(ARN=arn).get("TagList")),
+                      lambda arn=arn: os_.add_tags(ARN=arn, TagList=ctx.tagset()))
+
+
 # ---- 全局资源（每个账号只跑一次）----
 
 def h_s3(ctx):
@@ -306,6 +463,17 @@ def h_s3(ctx):
                                                    [arn], ctx.tagdict()))
 
 
+def h_route53(ctx):
+    r53 = ctx.client("route53", "us-east-1")
+    items = [("hostedzone", z["Id"].split("/")[-1]) for z in paginate(r53, "list_hosted_zones", "HostedZones")]
+    items += [("healthcheck", h["Id"]) for h in paginate(r53, "list_health_checks", "HealthChecks")]
+    for rtype, rid in items:
+        tags = tdict(r53.list_tags_for_resource(ResourceType=rtype, ResourceId=rid)["ResourceTagSet"].get("Tags"))
+        yield Res(f"route53:{rtype}", f"arn:aws:route53:::{rtype}/{rid}", tags,
+                  lambda rtype=rtype, rid=rid: r53.change_tags_for_resource(
+                      ResourceType=rtype, ResourceId=rid, AddTags=ctx.tagset()))
+
+
 def h_cloudfront(ctx):
     cf = ctx.client("cloudfront", "us-east-1")
     for page in cf.get_paginator("list_distributions").paginate():
@@ -322,23 +490,32 @@ def h_cloudfront(ctx):
 # 但能覆盖第一层没写到的各种资源类型（SNS、SQS、KMS、日志组……）。
 # ----------------------------------------------------------------------------
 
+# 补扫跳过的服务：
+#   s3、cloudfront、route53   由 global 那次调用处理
+#   cloudformation            栈本身不产生费用；经 Tagging API 给栈打标签会走一次栈更新，把标签传到栈里所有资源，
+#                             StackSets 管理的栈还会和 StackSet 对不上
+SWEEP_SKIP_SERVICES = {"s3", "cloudfront", "route53", "cloudformation"}
+
+
 def h_sweep(ctx):
     rgt = ctx.client("resourcegroupstaggingapi")
     for m in paginate(rgt, "get_resources", "ResourceTagMappingList"):
         arn = m["ResourceARN"]
         svc = arn.split(":")[2]
-        if svc in ("s3", "cloudfront"):
-            continue   # 由 global 那次调用处理
+        if svc in SWEEP_SKIP_SERVICES:
+            continue
         yield Res(f"{svc} (sweep)", arn, tdict(m.get("Tags")),
                   lambda arn=arn: rgt_tag(rgt, [arn], ctx.tagdict()), from_sweep=True)
 
 
-GLOBAL_HANDLERS = [h_s3, h_cloudfront]
+GLOBAL_HANDLERS = [h_s3, h_cloudfront, h_route53]
 REGIONAL_HANDLERS = [
     h_ec2_instances, h_ec2_volumes, h_ec2_snapshots, h_ec2_images,
     h_ec2_eips, h_ec2_natgw, h_ec2_vpce,
     h_rds_instances, h_rds_clusters, h_rds_snapshots, h_rds_cluster_snapshots,
-    h_lambda, h_elbv2, h_dynamodb, h_efs, h_elasticache, h_eks,
+    h_lambda, h_elbv2, h_elb_classic, h_dynamodb, h_efs, h_elasticache, h_eks,
+    h_sqs, h_sns, h_kms, h_dms, h_dms_serverless, h_kafka, h_route53_resolver,
+    h_workspaces, h_memorydb, h_mq, h_docdb_elastic, h_ds, h_opensearch,
 ]
 
 
@@ -462,6 +639,8 @@ def scan(acct, region, tag_value):
                         row(res.rtype, res.rid, cur, "TAGGED")
                     except Exception as e:  # noqa: BLE001
                         row(res.rtype, res.rid, cur, "FAILED", str(e)[:500])
+        except ServiceUnavailable:
+            continue   # 服务没在这个 region 上线，不算错误
         except Exception as e:  # noqa: BLE001
             # 某个服务在该 region 不可用 / 没权限 / 被 SCP 拒绝，记下来继续跑
             row(h.__name__, "", "", "ERROR", str(e)[:500])

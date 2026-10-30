@@ -123,6 +123,13 @@ Resources:
               print(json.dumps(fields, ensure_ascii=False, default=str))
 
 
+          def collect(c, method, key, **kwargs):
+              """有分页器就翻完所有页，没有就单次调用。"""
+              if c.can_paginate(method):
+                  return [x for page in c.get_paginator(method).paginate(**kwargs) for x in page.get(key, []) or []]
+              return getattr(c, method)(**kwargs).get(key, []) or []
+
+
           def find(obj, key):
               """在嵌套的 dict/list 里递归找名为 key 的字段（不区分大小写），返回所有字符串值。
               各 API 的 responseElements 层级不一，按字段名找比写死路径稳。"""
@@ -282,6 +289,129 @@ Resources:
               client("cloudfront", "us-east-1").tag_resource(Resource=arn, Tags={"Items": tagset(value)})
 
 
+          def elb_get(name):
+              tds = client("elb").describe_tags(LoadBalancerNames=[name])["TagDescriptions"]
+              return tdict(tds[0].get("Tags")) if tds else {}
+
+
+          def elb_tag(name, value):
+              client("elb").add_tags(LoadBalancerNames=[name], Tags=tagset(value))
+
+
+          def sqs_get(url):
+              return client("sqs").list_queue_tags(QueueUrl=url).get("Tags", {}) or {}
+
+
+          def sqs_tag(url, value):
+              client("sqs").tag_queue(QueueUrl=url, Tags=tagdict(value))
+
+
+          def sns_get(arn):
+              return tdict(client("sns").list_tags_for_resource(ResourceArn=arn).get("Tags"))
+
+
+          def sns_tag(arn, value):
+              client("sns").tag_resource(ResourceArn=arn, Tags=tagset(value))
+
+
+          def kms_get(key_id):
+              # KMS 的标签字段叫 TagKey / TagValue
+              return {t["TagKey"]: t.get("TagValue", "") for t in collect(client("kms"), "list_resource_tags", "Tags", KeyId=key_id)}
+
+
+          def kms_tag(key_id, value):
+              client("kms").tag_resource(KeyId=key_id, Tags=[{"TagKey": TAG_KEY, "TagValue": value}])
+
+
+          def dms_get(arn):
+              return tdict(client("dms").list_tags_for_resource(ResourceArn=arn).get("TagList"))
+
+
+          def dms_tag(arn, value):
+              client("dms").add_tags_to_resource(ResourceArn=arn, Tags=tagset(value))
+
+
+          def kafka_get(arn):
+              return client("kafka").list_tags_for_resource(ResourceArn=arn).get("Tags", {}) or {}
+
+
+          def kafka_tag(arn, value):
+              client("kafka").tag_resource(ResourceArn=arn, Tags=tagdict(value))
+
+
+          def route53_parts(arn):
+              """arn:aws:route53:::hostedzone/Z123 -> ("hostedzone", "Z123")"""
+              rtype, rid = arn.split(":::")[1].split("/", 1)
+              return rtype, rid
+
+
+          def route53_get(arn):
+              rtype, rid = route53_parts(arn)
+              resp = client("route53", "us-east-1").list_tags_for_resource(ResourceType=rtype, ResourceId=rid)
+              return tdict(resp["ResourceTagSet"].get("Tags"))
+
+
+          def route53_tag(arn, value):
+              rtype, rid = route53_parts(arn)
+              client("route53", "us-east-1").change_tags_for_resource(ResourceType=rtype, ResourceId=rid, AddTags=tagset(value))
+
+
+          def resolver_get(arn):
+              return tdict(collect(client("route53resolver"), "list_tags_for_resource", "Tags", ResourceArn=arn))
+
+
+          def resolver_tag(arn, value):
+              client("route53resolver").tag_resource(ResourceArn=arn, Tags=tagset(value))
+
+
+          def workspaces_get(wid):
+              return tdict(client("workspaces").describe_tags(ResourceId=wid).get("TagList"))
+
+
+          def workspaces_tag(wid, value):
+              client("workspaces").create_tags(ResourceId=wid, Tags=tagset(value))
+
+
+          def memorydb_get(arn):
+              return tdict(client("memorydb").list_tags(ResourceArn=arn).get("TagList"))
+
+
+          def memorydb_tag(arn, value):
+              client("memorydb").tag_resource(ResourceArn=arn, Tags=tagset(value))
+
+
+          def mq_get(arn):
+              return client("mq").list_tags(ResourceArn=arn).get("Tags", {}) or {}
+
+
+          def mq_tag(arn, value):
+              client("mq").create_tags(ResourceArn=arn, Tags=tagdict(value))
+
+
+          def docdb_elastic_get(arn):
+              return client("docdb-elastic").list_tags_for_resource(resourceArn=arn).get("tags", {}) or {}
+
+
+          def docdb_elastic_tag(arn, value):
+              client("docdb-elastic").tag_resource(resourceArn=arn, tags=tagdict(value))
+
+
+          def ds_get(did):
+              return tdict(collect(client("ds"), "list_tags_for_resource", "Tags", ResourceId=did))
+
+
+          def ds_tag(did, value):
+              client("ds").add_tags_to_resource(ResourceId=did, Tags=tagset(value))
+
+
+          def opensearch_get(arn):
+              return tdict(client("opensearch").list_tags(ARN=arn).get("TagList"))
+
+
+          def opensearch_tag(arn, value):
+              client("opensearch").add_tags(ARN=arn, TagList=tagset(value))
+
+
           ADAPTERS = {
               "ec2": (ec2_get, ec2_tag),
               "rds": (rds_get, rds_tag),
@@ -293,6 +423,20 @@ Resources:
               "eks": (eks_get, eks_tag),
               "s3": (s3_get, s3_tag),
               "cloudfront": (cloudfront_get, cloudfront_tag),
+              "elb": (elb_get, elb_tag),
+              "sqs": (sqs_get, sqs_tag),
+              "sns": (sns_get, sns_tag),
+              "kms": (kms_get, kms_tag),
+              "dms": (dms_get, dms_tag),
+              "kafka": (kafka_get, kafka_tag),
+              "route53": (route53_get, route53_tag),
+              "route53resolver": (resolver_get, resolver_tag),
+              "workspaces": (workspaces_get, workspaces_tag),
+              "memorydb": (memorydb_get, memorydb_tag),
+              "mq": (mq_get, mq_tag),
+              "docdb-elastic": (docdb_elastic_get, docdb_elastic_tag),
+              "ds": (ds_get, ds_tag),
+              "opensearch": (opensearch_get, opensearch_tag),
           }
 
 
@@ -306,6 +450,11 @@ Resources:
           def from_resp(kind, rtype, key):
               """资源 ID 或 ARN 在 responseElements 里。"""
               return lambda d: [(kind, rtype, v) for v in find(d.get("responseElements"), key)]
+
+
+          def in_resp(kind, rtype, container, key):
+              """资源 ID 或 ARN 在 responseElements 的某个子对象里。同名字段可能在别处出现时用它限定范围。"""
+              return lambda d: [(kind, rtype, v) for v in find((d.get("responseElements") or {}).get(container), key)]
 
 
           def from_req(kind, rtype, key, arn_fmt, lower=False):
@@ -334,6 +483,25 @@ Resources:
                   out.append(("elasticache", "elasticache:cluster",
                               f"arn:aws:elasticache:{d['awsRegion']}:{d['recipientAccountId']}:cluster:{c}"))
               return out
+
+
+          def load_balancer(d):
+              # ALB、NLB、GWLB 的响应里有 loadBalancerArn；经典负载均衡器（CLB）没有，用请求里的名字
+              arns = find(d.get("responseElements"), "loadBalancerArn")
+              if arns:
+                  return [("elbv2", "elbv2:loadbalancer", a) for a in arns]
+              name = (d.get("requestParameters") or {}).get("loadBalancerName")
+              return [("elb", "elb:loadbalancer", name)] if isinstance(name, str) else []
+
+
+          def route53_resource(rtype, container):
+              # Route 53 是全局服务，事件只出现在 us-east-1；响应里的 id 形如 /hostedzone/Z123
+              def extract(d):
+                  rid = ((d.get("responseElements") or {}).get(container) or {}).get("id")
+                  if not isinstance(rid, str):
+                      return []
+                  return [("route53", f"route53:{rtype}", f"arn:aws:route53:::{rtype}/{rid.split('/')[-1]}")]
+              return extract
 
 
           def cloudfront_distribution(d):
@@ -376,9 +544,7 @@ Resources:
               (RDS, "CopyDBClusterSnapshot"): from_resp("rds", "rds:cluster-snapshot", "dBClusterSnapshotArn"),
 
               ("lambda.amazonaws.com", "CreateFunction20150331"): lambda_function,
-              # 经典负载均衡器（CLB）的响应里没有 loadBalancerArn，会记为 NO_ID
-              ("elasticloadbalancing.amazonaws.com", "CreateLoadBalancer"):
-                  from_resp("elbv2", "elbv2:loadbalancer", "loadBalancerArn"),
+              ("elasticloadbalancing.amazonaws.com", "CreateLoadBalancer"): load_balancer,
 
               (DDB, "CreateTable"): from_resp("dynamodb", "dynamodb:table", "tableArn"),
               (DDB, "RestoreTableFromBackup"): from_resp("dynamodb", "dynamodb:table", "tableArn"),
@@ -398,6 +564,33 @@ Resources:
               # CloudFront 是全局服务，事件只出现在 us-east-1
               ("cloudfront.amazonaws.com", "CreateDistribution"): cloudfront_distribution,
               ("cloudfront.amazonaws.com", "CreateDistributionWithTags"): cloudfront_distribution,
+
+              ("sqs.amazonaws.com", "CreateQueue"): from_resp("sqs", "sqs:queue", "queueUrl"),
+              ("sns.amazonaws.com", "CreateTopic"): from_resp("sns", "sns:topic", "topicArn"),
+              ("kms.amazonaws.com", "CreateKey"): from_resp("kms", "kms:key", "keyId"),
+              ("dms.amazonaws.com", "CreateReplicationInstance"):
+                  from_resp("dms", "dms:replication-instance", "replicationInstanceArn"),
+              ("dms.amazonaws.com", "CreateReplicationConfig"):
+                  from_resp("dms", "dms:replication-config", "replicationConfigArn"),
+              ("kafka.amazonaws.com", "CreateCluster"): from_resp("kafka", "kafka:cluster", "clusterArn"),
+              ("kafka.amazonaws.com", "CreateClusterV2"): from_resp("kafka", "kafka:cluster", "clusterArn"),
+              ("route53.amazonaws.com", "CreateHostedZone"): route53_resource("hostedzone", "hostedZone"),
+              ("route53.amazonaws.com", "CreateHealthCheck"): route53_resource("healthcheck", "healthCheck"),
+              ("route53resolver.amazonaws.com", "CreateResolverEndpoint"):
+                  in_resp("route53resolver", "route53resolver:resolver-endpoint", "resolverEndpoint", "arn"),
+              ("route53resolver.amazonaws.com", "CreateResolverRule"):
+                  in_resp("route53resolver", "route53resolver:resolver-rule", "resolverRule", "arn"),
+              ("workspaces.amazonaws.com", "CreateWorkspaces"):
+                  in_resp("workspaces", "workspaces:workspace", "pendingRequests", "workspaceId"),
+              ("memorydb.amazonaws.com", "CreateCluster"): in_resp("memorydb", "memorydb:cluster", "cluster", "arn"),
+              ("mq.amazonaws.com", "CreateBroker"): from_resp("mq", "mq:broker", "brokerArn"),
+              ("docdb-elastic.amazonaws.com", "CreateCluster"):
+                  in_resp("docdb-elastic", "docdb-elastic:cluster", "cluster", "clusterArn"),
+              ("ds.amazonaws.com", "CreateDirectory"): from_resp("ds", "ds:directory", "directoryId"),
+              ("ds.amazonaws.com", "CreateMicrosoftAD"): from_resp("ds", "ds:directory", "directoryId"),
+              ("ds.amazonaws.com", "ConnectDirectory"): from_resp("ds", "ds:directory", "directoryId"),
+              ("es.amazonaws.com", "CreateDomain"): in_resp("opensearch", "es:domain", "domainStatus", "arn"),
+              ("es.amazonaws.com", "CreateElasticsearchDomain"): in_resp("opensearch", "es:domain", "domainStatus", "arn"),
           }
 
 
@@ -522,42 +715,72 @@ Resources:
         detail:
           eventSource:
             - "cloudfront.amazonaws.com"
+            - "dms.amazonaws.com"
+            - "docdb-elastic.amazonaws.com"
+            - "ds.amazonaws.com"
             - "dynamodb.amazonaws.com"
             - "ec2.amazonaws.com"
             - "eks.amazonaws.com"
             - "elasticache.amazonaws.com"
             - "elasticfilesystem.amazonaws.com"
             - "elasticloadbalancing.amazonaws.com"
+            - "es.amazonaws.com"
+            - "kafka.amazonaws.com"
+            - "kms.amazonaws.com"
             - "lambda.amazonaws.com"
+            - "memorydb.amazonaws.com"
+            - "mq.amazonaws.com"
             - "rds.amazonaws.com"
+            - "route53.amazonaws.com"
+            - "route53resolver.amazonaws.com"
             - "s3.amazonaws.com"
+            - "sns.amazonaws.com"
+            - "sqs.amazonaws.com"
+            - "workspaces.amazonaws.com"
           eventName:
             - "AllocateAddress"
+            - "ConnectDirectory"
             - "CopyDBClusterSnapshot"
             - "CopyDBSnapshot"
             - "CopyImage"
             - "CopySnapshot"
+            - "CreateBroker"
             - "CreateBucket"
             - "CreateCacheCluster"
             - "CreateCluster"
+            - "CreateClusterV2"
             - "CreateDBCluster"
             - "CreateDBClusterSnapshot"
             - "CreateDBInstance"
             - "CreateDBInstanceReadReplica"
             - "CreateDBSnapshot"
+            - "CreateDirectory"
             - "CreateDistribution"
             - "CreateDistributionWithTags"
+            - "CreateDomain"
+            - "CreateElasticsearchDomain"
             - "CreateFileSystem"
             - "CreateFunction20150331"
+            - "CreateHealthCheck"
+            - "CreateHostedZone"
             - "CreateImage"
+            - "CreateKey"
             - "CreateLoadBalancer"
+            - "CreateMicrosoftAD"
             - "CreateNatGateway"
+            - "CreateQueue"
+            - "CreateReplicationConfig"
             - "CreateReplicationGroup"
+            - "CreateReplicationInstance"
+            - "CreateResolverEndpoint"
+            - "CreateResolverRule"
             - "CreateSnapshot"
             - "CreateSnapshots"
             - "CreateTable"
+            - "CreateTopic"
             - "CreateVolume"
             - "CreateVpcEndpoint"
+            - "CreateWorkspaces"
             - "ImportTable"
             - "RegisterImage"
             - "RestoreDBClusterFromS3"
