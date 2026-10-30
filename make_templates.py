@@ -7,8 +7,8 @@ make_templates.py
                             IAM 是全局的，每个账号只部署到一个 region。
   map-tagger-realtime.yaml  实时层 Lambda 和 EventBridge 规则，每个账号部署到每个用到的 region。
 
-两个 StackSet 都按 OU 自动部署，目标 OU 里的每个账号都会有这些资源；
-不在账号映射表里的账号，两层都不处理，这些资源在那里只是空转。
+两个 StackSet 都部署到整个组织并打开自动部署，每个成员账号都会有这些资源；
+在账号映射表里被排除的账号，两层都不处理，这些资源在那里只是空转。
 
 实时层的代码和 EventBridge 事件模式都直接从 realtime_tagger.py 取。
 改了 realtime_tagger.py 或下面的权限列表后，重新运行：
@@ -199,7 +199,7 @@ MAP_TAGGER_POLICY = policy(
 
 ROLES_TEMPLATE = {
     "AWSTemplateFormatVersion": "2010-09-09",
-    "Description": "org-tagger: MapTaggerRole 和 MapRealtimeTaggerRole。目标 OU 里的每个账号只部署到一个 region。",
+    "Description": "org-tagger: MapTaggerRole 和 MapRealtimeTaggerRole。每个成员账号只部署到一个 region。",
     "Parameters": {
         "PayerAccountId": {"Type": "String", "AllowedPattern": "^[0-9]{12}$",
                            "Description": "Payer（管理账号）的账号 ID"},
@@ -245,7 +245,7 @@ ROLES_TEMPLATE = {
 REALTIME_TEMPLATE = {
     "AWSTemplateFormatVersion": "2010-09-09",
     "Description": "org-tagger 实时层: Lambda map-realtime-tagger 和 EventBridge 规则。"
-                   "目标 OU 里的每个账号部署到每个用到的 region（含 us-east-1）。",
+                   "每个成员账号部署到每个用到的 region（含 us-east-1）。",
     "Parameters": {
         "MappingParameterArn": MAPPING_PARAM_PARAMETER,
         "TagKey": TAG_KEY_PARAMETER,
@@ -346,9 +346,9 @@ def main():
         raise SystemExit(f"MapTagger 策略 {size} 字符，超过 IAM 内联策略上限 {INLINE_POLICY_LIMIT}")
     OUT.mkdir(exist_ok=True)
     write("map-tagger-roles.yaml", ROLES_TEMPLATE,
-          "StackSet map-tagger-roles：按 OU 自动部署，每个账号只部署到一个 region")
+          "StackSet map-tagger-roles：部署到整个组织并自动部署，每个账号只部署到一个 region")
     write("map-tagger-realtime.yaml", REALTIME_TEMPLATE,
-          "StackSet map-tagger-realtime：按 OU 自动部署，每个账号部署到每个用到的 region（含 us-east-1）")
+          "StackSet map-tagger-realtime：部署到整个组织并自动部署，每个账号部署到每个用到的 region（含 us-east-1）")
     print(f"MapTagger 策略 {size} / {INLINE_POLICY_LIMIT} 字符，第二层补扫覆盖 {len(SWEEP_TAG_ACTIONS)} 条打标签权限")
 
 

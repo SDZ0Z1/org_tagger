@@ -2,7 +2,7 @@
 """
 realtime_tagger.py
 
-由 StackSets 部署到目标 OU 里每个账号、每个 region 的 Lambda 函数，资源一创建就补标签：
+由 StackSets 部署到组织里每个成员账号、每个 region 的 Lambda 函数，资源一创建就补标签：
   资源创建 API → CloudTrail → EventBridge 规则 → 本函数
   → 从事件里取出新资源 → 缺少指定标签就补上。
 
@@ -10,8 +10,9 @@ realtime_tagger.py
 本函数让新资源几分钟内带上标签；漏掉的（事件丢失、未覆盖的 API、资源创建中拒绝打标签等）
 仍由 sweep_tagger.py 每天兜底。
 
-标签值从 Payer 用 RAM 共享过来的账号映射表里查（和 sweep_tagger.py 读的是同一个 SSM 参数），
-本账号不在表里就只记一行 SKIP，所以目标 OU 里的非 MAP 账号也可以放心部署。映射表缓存 5 分钟。
+标签值从 Payer 用 RAM 共享过来的账号映射表里查（和 sweep_tagger.py 读的是同一个 SSM 参数，规则也一样）：
+本账号有自己的条目就用它，没有就用 "*" 的默认值（"*" 不用于 Payer）；值为空表示排除，只记一行 SKIP。
+映射表缓存 5 分钟。
 
 环境变量：
   MAPPING_PARAM  账号映射表 SSM 参数的完整 ARN，如 arn:aws:ssm:ap-southeast-1:123456789012:parameter/map-tagger/accounts
@@ -98,7 +99,7 @@ def find(obj, key):
 
 
 def load_mapping():
-    """读账号映射表 {"账号ID": "MPE 值"}，缓存 MAPPING_TTL 秒。
+    """读账号映射表 {"*": 默认值, "账号ID": 值}，缓存 MAPPING_TTL 秒。
     共享参数要用完整 ARN 读，并且要到参数所在的 region 去读。"""
     if time.time() - _mapping["at"] < MAPPING_TTL:
         return _mapping["value"]
@@ -106,18 +107,25 @@ def load_mapping():
     value = client("ssm", region).get_parameter(Name=MAPPING_PARAM)["Parameter"]["Value"]
     mapping = json.loads(value)
     if not isinstance(mapping, dict):
-        raise ValueError(f'{MAPPING_PARAM} 应该是 {{"账号ID": "MPE 值"}} 格式的 JSON 对象')
-    _mapping.update(at=time.time(), value={str(k).strip(): str(v).strip() for k, v in mapping.items()})
+        raise ValueError(f'{MAPPING_PARAM} 应该是 {{"*": "MPE 值", "账号ID": "MPE 值"}} 格式的 JSON 对象')
+    _mapping.update(at=time.time(), value={str(k).strip(): str(v or "").strip() for k, v in mapping.items()})
     return _mapping["value"]
 
 
 def tag_value_for(account):
-    """本账号该打的标签值；不在映射表里返回 None。"""
+    """本账号该打的标签值；被排除时返回 None。规则和 sweep_tagger.value_for 一致。"""
     if TAG_VALUE:
         return TAG_VALUE
     if not MAPPING_PARAM:
         raise RuntimeError("没有设置环境变量 MAPPING_PARAM（或 TAG_VALUE）")
-    return load_mapping().get(account)
+    mapping = load_mapping()
+    if account in mapping:
+        return mapping[account] or None
+    # 映射表放在 Payer 里：ARN 里的账号就是 Payer；只给了参数名说明本函数就在 Payer 里
+    payer = MAPPING_PARAM.split(":")[4] if MAPPING_PARAM.startswith("arn:") else account
+    if account == payer:
+        return None
+    return mapping.get("*") or None
 
 
 # ----------------------------------------------------------------------------
@@ -432,7 +440,7 @@ def lambda_handler(event, context):
 
     value = tag_value_for(d["recipientAccountId"])
     if not value:
-        log(**base, action="SKIP", detail="本账号不在账号映射表里")
+        log(**base, action="SKIP", detail='本账号被排除：映射表里它的值为空，或者没有 "*" 也没有它的条目')
         return {"processed": 0}
 
     targets = list(dict.fromkeys(extract(d)))   # 去重，保持顺序

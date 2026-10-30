@@ -1,8 +1,8 @@
-# StackSet map-tagger-roles：按 OU 自动部署，每个账号只部署到一个 region
+# StackSet map-tagger-roles：部署到整个组织并自动部署，每个账号只部署到一个 region
 # 本文件由 make_templates.py 生成，不要手动修改。
 
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "org-tagger: MapTaggerRole 和 MapRealtimeTaggerRole。目标 OU 里的每个账号只部署到一个 region。"
+Description: "org-tagger: MapTaggerRole 和 MapRealtimeTaggerRole。每个成员账号只部署到一个 region。"
 Parameters:
   PayerAccountId:
     Type: "String"

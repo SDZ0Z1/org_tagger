@@ -1,8 +1,8 @@
-# StackSet map-tagger-realtime：按 OU 自动部署，每个账号部署到每个用到的 region（含 us-east-1）
+# StackSet map-tagger-realtime：部署到整个组织并自动部署，每个账号部署到每个用到的 region（含 us-east-1）
 # 本文件由 make_templates.py 生成，不要手动修改。
 
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "org-tagger 实时层: Lambda map-realtime-tagger 和 EventBridge 规则。目标 OU 里的每个账号部署到每个用到的 region（含 us-east-1）。"
+Description: "org-tagger 实时层: Lambda map-realtime-tagger 和 EventBridge 规则。每个成员账号部署到每个用到的 region（含 us-east-1）。"
 Parameters:
   MappingParameterArn:
     Type: "String"
@@ -44,7 +44,7 @@ Resources:
           """
           realtime_tagger.py
 
-          由 StackSets 部署到目标 OU 里每个账号、每个 region 的 Lambda 函数，资源一创建就补标签：
+          由 StackSets 部署到组织里每个成员账号、每个 region 的 Lambda 函数，资源一创建就补标签：
             资源创建 API → CloudTrail → EventBridge 规则 → 本函数
             → 从事件里取出新资源 → 缺少指定标签就补上。
 
@@ -52,8 +52,9 @@ Resources:
           本函数让新资源几分钟内带上标签；漏掉的（事件丢失、未覆盖的 API、资源创建中拒绝打标签等）
           仍由 sweep_tagger.py 每天兜底。
 
-          标签值从 Payer 用 RAM 共享过来的账号映射表里查（和 sweep_tagger.py 读的是同一个 SSM 参数），
-          本账号不在表里就只记一行 SKIP，所以目标 OU 里的非 MAP 账号也可以放心部署。映射表缓存 5 分钟。
+          标签值从 Payer 用 RAM 共享过来的账号映射表里查（和 sweep_tagger.py 读的是同一个 SSM 参数，规则也一样）：
+          本账号有自己的条目就用它，没有就用 "*" 的默认值（"*" 不用于 Payer）；值为空表示排除，只记一行 SKIP。
+          映射表缓存 5 分钟。
 
           环境变量：
             MAPPING_PARAM  账号映射表 SSM 参数的完整 ARN，如 arn:aws:ssm:ap-southeast-1:123456789012:parameter/map-tagger/accounts
@@ -140,7 +141,7 @@ Resources:
 
 
           def load_mapping():
-              """读账号映射表 {"账号ID": "MPE 值"}，缓存 MAPPING_TTL 秒。
+              """读账号映射表 {"*": 默认值, "账号ID": 值}，缓存 MAPPING_TTL 秒。
               共享参数要用完整 ARN 读，并且要到参数所在的 region 去读。"""
               if time.time() - _mapping["at"] < MAPPING_TTL:
                   return _mapping["value"]
@@ -148,18 +149,25 @@ Resources:
               value = client("ssm", region).get_parameter(Name=MAPPING_PARAM)["Parameter"]["Value"]
               mapping = json.loads(value)
               if not isinstance(mapping, dict):
-                  raise ValueError(f'{MAPPING_PARAM} 应该是 {{"账号ID": "MPE 值"}} 格式的 JSON 对象')
-              _mapping.update(at=time.time(), value={str(k).strip(): str(v).strip() for k, v in mapping.items()})
+                  raise ValueError(f'{MAPPING_PARAM} 应该是 {{"*": "MPE 值", "账号ID": "MPE 值"}} 格式的 JSON 对象')
+              _mapping.update(at=time.time(), value={str(k).strip(): str(v or "").strip() for k, v in mapping.items()})
               return _mapping["value"]
 
 
           def tag_value_for(account):
-              """本账号该打的标签值；不在映射表里返回 None。"""
+              """本账号该打的标签值；被排除时返回 None。规则和 sweep_tagger.value_for 一致。"""
               if TAG_VALUE:
                   return TAG_VALUE
               if not MAPPING_PARAM:
                   raise RuntimeError("没有设置环境变量 MAPPING_PARAM（或 TAG_VALUE）")
-              return load_mapping().get(account)
+              mapping = load_mapping()
+              if account in mapping:
+                  return mapping[account] or None
+              # 映射表放在 Payer 里：ARN 里的账号就是 Payer；只给了参数名说明本函数就在 Payer 里
+              payer = MAPPING_PARAM.split(":")[4] if MAPPING_PARAM.startswith("arn:") else account
+              if account == payer:
+                  return None
+              return mapping.get("*") or None
 
 
           # ----------------------------------------------------------------------------
@@ -474,7 +482,7 @@ Resources:
 
               value = tag_value_for(d["recipientAccountId"])
               if not value:
-                  log(**base, action="SKIP", detail="本账号不在账号映射表里")
+                  log(**base, action="SKIP", detail='本账号被排除：映射表里它的值为空，或者没有 "*" 也没有它的条目')
                   return {"processed": 0}
 
               targets = list(dict.fromkeys(extract(d)))   # 去重，保持顺序

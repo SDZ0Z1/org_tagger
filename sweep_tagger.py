@@ -3,15 +3,17 @@
 sweep_tagger.py
 
 部署在 Payer（管理账号）的 Lambda 函数，每天由 EventBridge Scheduler 触发一次，
-给 MAP 白名单账号里缺少标签的资源补上，兜住实时层（realtime_tagger.py）漏掉的。
+给组织里各成员账号缺少标签的资源补上，兜住实时层（realtime_tagger.py）漏掉的。
 
-白名单和每个账号的标签值来自 SSM 参数里的账号映射表，例如：
-  {"111122223333": "migXXXXXXXXXX", "444455556666": "migYYYYYYYYYY"}
-不在表里的账号不处理。
+每个账号打什么值，来自 SSM 参数里的账号映射表，例如：
+  {"*": "migXXXXXXXXXX", "444455556666": "migYYYYYYYYYY", "777788889999": ""}
+  "*"         所有 ACTIVE 成员账号的默认值（从 Organizations 列出，不含 Payer 自己）
+  12 位账号 ID  这个账号用自己的值；值为空表示排除这个账号
+Payer 自己只有在表里单独写一行时才处理。
 
 一次运行由同一个函数的两种调用组成：
-  调度：Scheduler 触发，事件里没有 account。读出映射表，确认每个账号能 assume 进 MapTaggerRole、
-        取得已启用的 region，再按“账号 × region”异步调用本函数自己，另外每个账号调用一次 global。
+  调度：Scheduler 触发，事件里没有 account。按映射表算出要处理的账号，确认每个账号能 assume 进
+        MapTaggerRole、取得已启用的 region，再按“账号 × region”异步调用本函数自己，另外每个账号调用一次 global。
   扫描：事件里有 account 和 region。assume 进该账号的 MapTaggerRole，枚举这个 region 的资源，
         缺标签的补上；region 为 global 时处理 S3 和 CloudFront。
 拆开是因为 Lambda 单次调用最长 15 分钟，整个组织放在一次调用里可能跑不完。
@@ -33,7 +35,7 @@ sweep_tagger.py
 说明：
   - 仅供参考，请先用 MODE=dryrun 验证后再改成 apply。
   - 只支持 aws 标准分区，不含中国区（aws-cn）。
-  - Payer 自己的资源也要扫描时，在 Payer 里同样建 MapTaggerRole，并把 Payer 写进映射表。
+  - Payer 自己的资源也要扫描时，在 Payer 里同样建 MapTaggerRole，并把 Payer 单独写进映射表。
 """
 import json
 import os
@@ -345,13 +347,33 @@ REGIONAL_HANDLERS = [
 # ----------------------------------------------------------------------------
 
 def load_mapping():
-    """读 SSM 里的账号映射表：{"账号ID": "MPE 值"}。"""
+    """读 SSM 里的账号映射表：{"*": 默认值, "账号ID": 值}。"""
     value = boto3.client("ssm", region_name=REGION, config=BOTO_CFG).get_parameter(
         Name=MAPPING_PARAM)["Parameter"]["Value"]
     mapping = json.loads(value)
     if not isinstance(mapping, dict):
-        raise ValueError(f'{MAPPING_PARAM} 应该是 {{"账号ID": "MPE 值"}} 格式的 JSON 对象')
-    return {str(k).strip(): str(v).strip() for k, v in mapping.items()}
+        raise ValueError(f'{MAPPING_PARAM} 应该是 {{"*": "MPE 值", "账号ID": "MPE 值"}} 格式的 JSON 对象')
+    return {str(k).strip(): str(v or "").strip() for k, v in mapping.items()}
+
+
+def value_for(mapping, acct, payer_id):
+    """账号该打的标签值：先看账号自己的条目，再看 "*"（不用于 Payer）；被排除时返回 None。"""
+    if acct in mapping:
+        return mapping[acct] or None
+    if acct == payer_id:
+        return None
+    return mapping.get("*") or None
+
+
+def list_member_accounts(payer_id):
+    """Organizations 里所有 ACTIVE 的成员账号，不含 Payer 自己。"""
+    org = boto3.client("organizations", region_name=REGION, config=BOTO_CFG)
+    out = []
+    for a in paginate(org, "list_accounts", "Accounts"):
+        state = a.get("State") or a.get("Status")   # 新字段 State，旧字段 Status
+        if state == "ACTIVE" and a["Id"] != payer_id:
+            out.append(a["Id"])
+    return out
 
 
 def enabled_regions(sess):
@@ -360,16 +382,27 @@ def enabled_regions(sess):
     return sorted(r["RegionName"] for r in ec2.describe_regions()["Regions"])
 
 
-def dispatch(function_name):
-    """调度：按“账号 × region”异步调用本函数，每个账号另加一次 global。"""
+def dispatch(function_name, payer_id):
+    """调度：按映射表算出要处理的账号，按“账号 × region”异步调用本函数，每个账号另加一次 global。"""
     mapping = load_mapping()
+    for key in [k for k in mapping if k != "*" and not (k.isdigit() and len(k) == 12)]:
+        log(account_id=key, region="-", type="mapping", resource="", current_value="",
+            action="ERROR", detail='映射表的 key 要么是 "*"，要么是 12 位账号 ID')
+        del mapping[key]
+
+    accounts = {k for k in mapping if k != "*"}
+    if mapping.get("*"):
+        accounts |= set(list_member_accounts(payer_id))
+    targets = {}
+    for acct in sorted(accounts):
+        value = value_for(mapping, acct, payer_id)
+        if value:
+            targets[acct] = value
+
     lam = boto3.client("lambda", region_name=REGION, config=BOTO_CFG)
     jobs = 0
-    for acct, tag_value in mapping.items():
+    for acct, tag_value in targets.items():
         base = {"account_id": acct, "region": "-", "resource": "", "current_value": ""}
-        if not (acct.isdigit() and len(acct) == 12 and tag_value):
-            log(**base, type="mapping", action="ERROR", detail="映射表里的账号 ID 或 MPE 值不对")
-            continue
         try:
             regions = REGIONS or enabled_regions(get_session(acct))
         except Exception as e:  # noqa: BLE001
@@ -384,8 +417,8 @@ def dispatch(function_name):
             except Exception as e:  # noqa: BLE001
                 log(**dict(base, region=region), type="invoke", action="ERROR", detail=str(e)[:500])
     log(action="DISPATCHED", mode="apply" if APPLY else "dryrun",
-        detail=f"{len(mapping)} 个账号，{jobs} 次扫描调用")
-    return {"accounts": len(mapping), "jobs": jobs}
+        detail=f"{len(targets)} 个账号，{jobs} 次扫描调用")
+    return {"accounts": len(targets), "jobs": jobs}
 
 
 def scan(acct, region, tag_value):
@@ -437,15 +470,16 @@ def scan(acct, region, tag_value):
 
 def lambda_handler(event, context):
     event = event if isinstance(event, dict) else {}
+    payer_id = context.invoked_function_arn.split(":")[4]   # 本函数所在的账号就是 Payer
     acct = event.get("account")
     if not acct:
-        return dispatch(context.function_name)
+        return dispatch(context.function_name, payer_id)
 
     region = event.get("region")
     if not region:
         raise ValueError('扫描调用要带 region，例如 {"account": "111122223333", "region": "ap-southeast-1"}')
-    tag_value = event.get("tag_value") or load_mapping().get(acct)
+    tag_value = event.get("tag_value") or value_for(load_mapping(), acct, payer_id)
     if not tag_value:
-        raise ValueError(f"账号 {acct} 不在映射表 {MAPPING_PARAM} 里")
+        raise ValueError(f"账号 {acct} 在映射表 {MAPPING_PARAM} 里被排除，或者没有 \"*\" 也没有它的条目")
     counts = scan(acct, region, tag_value)
     return {"account": acct, "region": region, "mode": "apply" if APPLY else "dryrun", "counts": counts}
