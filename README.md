@@ -115,7 +115,7 @@ python realtime_tagger.py
 1. **调度**：Scheduler 每天 02:00 调用它，事件里没有账号信息。函数从 SSM 参数读出账号映射表；表里有 `"*"` 时，从 Organizations 列出所有 ACTIVE 成员账号（不含 Payer），再加上表里单独写的账号，去掉值为空的。然后对每个账号 assume 进 `MapTaggerRole`，取得已启用的 region（或用环境变量 `REGIONS` 指定），然后按“账号 × region”异步调用自己，每个账号另加一次 `global`。assume 失败的账号记一行 `ERROR`，不发起扫描。
 2. **扫描**：每次调用只处理一个账号的一个 region。先 assume 进该账号的 `MapTaggerRole`，再分两层枚举资源，比较现值，按上面的规则处理。`global` 那次处理 S3、CloudFront 和 Route 53。某个服务没在这个 region 上线（接口域名解析不了）时直接跳过，不记 `ERROR`。
    - **第一层：服务原生 API。** 能找到从没打过任何标签的资源，覆盖的类型见下表。
-   - **第二层：Resource Groups Tagging API 补扫。** 用 `GetResources` 覆盖第一层没写到的各种类型，但它只返回“当前有标签或曾经打过标签”的资源。第一层处理过的资源会跳过，不重复记录；S3、CloudFront、Route 53 由 `global` 那次处理，这里也跳过。CloudFormation 栈也会跳过：栈本身不产生费用，经 Tagging API 给栈打标签会走一次栈更新，把标签传到栈里所有资源，StackSets 管理的栈还会和 StackSet 对不上。环境变量 `NO_SWEEP=true` 可以关掉这一层。
+   - **第二层：Resource Groups Tagging API 补扫。** 用 `GetResources` 覆盖第一层没写到的各种类型，但它只返回“当前有标签或曾经打过标签”的资源。第一层处理过的资源会跳过，不重复记录；S3、CloudFront、Route 53 由 `global` 那次处理，这里也跳过。CloudFormation 栈也会跳过：栈本身不产生费用，经 Tagging API 给栈打标签会走一次栈更新，把标签传到栈里所有资源，StackSets 管理的栈还会和 StackSet 对不上。预算（budgets）和付款方式（payments）同样不产生费用，Tagging API 也打不上，一并跳过。环境变量 `NO_SWEEP=true` 可以关掉这一层。
 
 拆成这么多次调用，是因为 Lambda 单次调用最长 15 分钟，整个组织放在一次调用里可能跑不完；每次只处理一个 region，大账号也来得及。同时跑多少个，由函数的预留并发控制。
 
@@ -149,7 +149,7 @@ Payer 自己的资源也通过 `MapTaggerRole` 处理，但 `"*"` 不包括 Paye
 | Region | `sqs:queue` | |
 | Region | `sns:topic` | |
 | Region | `kms:key` | 只含客户托管的密钥；AWS 托管的密钥不能打标签，等待删除、等待导入的也跳过 |
-| Region | `dms:replication-instance`、`dms:replication-config` | 复制实例和 DMS Serverless 复制配置 |
+| Region | `dms:replication-instance`、`dms:replication-config` | 复制实例和 DMS Serverless 复制配置。DMS Serverless 没在部分较新的 region 上线，那里调用会返回 AccessDenied，直接跳过 |
 | Region | `kafka:cluster` | MSK，含 Serverless |
 | Region | `route53resolver:resolver-endpoint`、`route53resolver:resolver-rule` | 规则不含 AWS 自带的和别的账号共享过来的 |
 | Region | `workspaces:workspace` | 不含 terminating、terminated 状态 |

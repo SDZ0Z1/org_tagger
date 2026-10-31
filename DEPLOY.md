@@ -503,6 +503,7 @@ fields account_id, region, type, resource, current_value, action, detail
 | Lambda 的 Monitor 页签或 CloudWatch 提示日志组不存在 | 函数在这个 region 还没被触发过，日志组要第一次运行时才会建出来，属正常。建个测试资源触发一次就会出现 |
 | StackSet 实例 FAILED：should enable &lt;region&gt; | 该账号没启用这个 opt-in region，属正常，可以不管。账号以后启用了它，按 [3.9](#39-修改-stackset) 再提交一次就会部署上去 |
 | StackSet 实例 CANCELLED：Cancelled since failure tolerance has exceeded | 被别的失败连带取消。按 3.3 的部署选项（并发和失败容忍度都填 100%、Soft 模式），用 [3.9](#39-修改-stackset) 再提交一次 |
+| 某个 region 的 `ERROR` 是 InternalFailure、TooManyRequestsException 这类服务端错误 | botocore 已经重试过多次，说明那个 region 的服务端当时有问题，和代码、权限无关。偶尔出现可以忽略，第二天会自动补上；同一个 region 连续多天出现，在 AWS Health Dashboard 看看那个 region 有没有服务事件 |
 | 某个 region 报 Connect timeout on endpoint URL | 连不上那个 region 的接口，多半是 region 本身的问题，可以在 AWS Health Dashboard 确认。部署时出现：等恢复后对这个 region 重跑。每日扫描时出现：那个 region 会有 `ERROR`，扫描调用还会因超时被强制结束；长期如此的话，给扫描 Lambda 设 `REGIONS`，只列要扫的 region |
 | 标签值要改（例如换 MPE 值） | 改映射表里 `"*"` 或该账号的值。旧值会显示为 `CONFLICT`，确认要覆盖时，临时把扫描 Lambda 的 `OVERWRITE` 设成 `true` 跑一次，跑完改回 `false`，避免以后误覆盖别人打的值 |
 | `ERROR`，`type` 为 `assume_role`，`region` 为 `-` | 该账号没有 `MapTaggerRole`：StackSets 没部署到它（部署目标没覆盖、或部署失败），或者部署时 `PayerAccountId` 填错了。如果 Payer 里的 `MapSweepLambdaRole` 被删掉重建过，要在 `map-tagger-roles` 里把 stack 实例删掉再重新添加，让信任策略重新指向新角色；期间实时层会因为执行角色不存在而报错，重新添加后恢复 |

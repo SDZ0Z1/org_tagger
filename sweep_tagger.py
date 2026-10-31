@@ -349,7 +349,15 @@ def h_dms_serverless(ctx):
     dms = ctx.client("dms")
     kwargs = {}
     while True:   # 这个 API 没有分页器，按 Marker 自己翻页
-        resp = dms.describe_replication_configs(**kwargs)
+        try:
+            resp = dms.describe_replication_configs(**kwargs)
+        except ClientError as e:
+            # DMS Serverless 没在部分较新的 region 上线，那里调用会返回 AccessDenied。
+            # 报错写着 not authorized 的是真的缺 IAM 权限，照常报错
+            err = e.response["Error"]
+            if err["Code"] == "AccessDeniedException" and "not authorized" not in err.get("Message", ""):
+                return
+            raise
         for c in resp.get("ReplicationConfigs", []) or []:
             arn = c["ReplicationConfigArn"]
             yield Res("dms:replication-config", arn, tdict(dms.list_tags_for_resource(ResourceArn=arn).get("TagList")),
@@ -494,7 +502,8 @@ def h_cloudfront(ctx):
 #   s3、cloudfront、route53   由 global 那次调用处理
 #   cloudformation            栈本身不产生费用；经 Tagging API 给栈打标签会走一次栈更新，把标签传到栈里所有资源，
 #                             StackSets 管理的栈还会和 StackSet 对不上
-SWEEP_SKIP_SERVICES = {"s3", "cloudfront", "route53", "cloudformation"}
+#   budgets、payments         预算和付款方式本身不产生费用，Tagging API 也打不上
+SWEEP_SKIP_SERVICES = {"s3", "cloudfront", "route53", "cloudformation", "budgets", "payments"}
 
 
 def h_sweep(ctx):
