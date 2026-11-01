@@ -103,6 +103,7 @@ python realtime_tagger.py
 | `MAPPING_PARAM` | 必填 | 账号映射表 SSM 参数的完整 ARN（模板参数 `MappingParameterArn`） |
 | `TAG_KEY` | `map-migrated` | 标签 key（模板参数 `TagKey`） |
 | `MODE` | `dryrun` | `dryrun` 只写日志；`apply` 才真正打标签（模板参数 `Mode`） |
+| `LOG_RETENTION_DAYS` | `180` | 本函数日志组的保留天数（模板参数 `LogRetentionDays`）。日志组是函数第一次运行时自动建的，模板管不到，所以由函数在每个执行环境第一次运行时自己设置；没设这个变量就不改动日志组 |
 | `TAG_VALUE` | 无 | 可选。填了就直接用这个值，不查映射表，一般只在单独测试时用 |
 | `OVERWRITE` | `false` | `true` 时覆盖已有的不同值 |
 
@@ -208,10 +209,10 @@ Payer 自己的资源也通过 `MapTaggerRole` 处理，但 `"*"` 不包括 Paye
 
 两个函数每处理一个资源，都往各自的 CloudWatch 日志组写一行 JSON：
 
-| 函数 | 日志组 |
-| --- | --- |
-| 实时层 | `/aws/lambda/map-realtime-tagger`（在各成员账号的各 region） |
-| 每日扫描 | `/aws/lambda/map-daily-sweep`（在 Payer） |
+| 函数 | 日志组 | 保留期 |
+| --- | --- | --- |
+| 实时层 | `/aws/lambda/map-realtime-tagger`（在各成员账号的各 region） | 由函数自己按 `LOG_RETENTION_DAYS` 设置，默认 180 天 |
+| 每日扫描 | `/aws/lambda/map-daily-sweep`（在 Payer） | 在 CloudWatch 控制台手动设置，见 [DEPLOY.md](DEPLOY.md#设置每天定时运行) |
 
 | 字段 | 说明 |
 | --- | --- |
@@ -235,6 +236,7 @@ Payer 自己的资源也通过 `MapTaggerRole` 处理，但 `"*"` 不包括 Paye
 | `SKIP` | 只有实时层有：事件不在处理范围，或者本账号在映射表里被排除。规则按事件来源和事件名分别匹配，会混进别的服务的同名事件，例如 ElastiCache 的 CreateSnapshot，属于正常情况 |
 | `NO_ID` | 只有实时层有：事件在处理范围，但没找到资源 ID。`detail` 里附了事件原文，多半是事件格式和预期不同 |
 | `DISPATCHED` | 只有每日扫描有：调度完成，`detail` 里是账号数和发起的扫描次数 |
+| `WARN` | 只有实时层有：没能设置日志组的保留期，例如执行角色还没更新到有 `logs:PutRetentionPolicy` 权限的版本。不影响打标签，下次运行会再试 |
 
 在 CloudWatch Logs Insights 里选对应的日志组，用下面的查询看需要关注的记录：
 

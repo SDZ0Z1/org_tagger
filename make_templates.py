@@ -24,6 +24,10 @@ import realtime_tagger
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "templates"
 SWEEP_ROLE = "MapSweepLambdaRole"      # Payer 里扫描 Lambda 的执行角色，MapTaggerRole 只信任它
+REALTIME_FUNCTION = "map-realtime-tagger"
+# CloudWatch Logs 接受的保留天数
+LOG_RETENTION_VALUES = ["1", "3", "5", "7", "14", "30", "60", "90", "120", "150", "180", "365", "400",
+                        "545", "731", "1096", "1827", "2192", "2557", "2922", "3288", "3653"]
 INLINE_POLICY_LIMIT = 10240            # 一个角色的内联策略加起来的字符上限（不算空白）
 EVENT_PATTERN_LIMIT = 4096             # EventBridge 规则事件模式的字符上限
 
@@ -257,6 +261,14 @@ ROLES_TEMPLATE = {
                     statement("AddTags", REALTIME_TAG_ACTIONS),
                     {"Sid": "ReadMapping", "Effect": "Allow", "Action": "ssm:GetParameter",
                      "Resource": {"Ref": "MappingParameterArn"}},
+                    # 函数给自己的日志组设保留期（realtime_tagger.ensure_log_retention）
+                    {"Sid": "SetOwnLogRetention", "Effect": "Allow", "Action": "logs:PutRetentionPolicy",
+                     "Resource": [
+                         {"Fn::Sub": "arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:/aws/lambda/"
+                                     + REALTIME_FUNCTION},
+                         {"Fn::Sub": "arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:/aws/lambda/"
+                                     + REALTIME_FUNCTION + ":*"},
+                     ]},
                 )}],
             },
         },
@@ -272,12 +284,14 @@ REALTIME_TEMPLATE = {
         "TagKey": TAG_KEY_PARAMETER,
         "Mode": {"Type": "String", "Default": "dryrun", "AllowedValues": ["dryrun", "apply"],
                  "Description": "dryrun 只写日志；apply 才真正打标签"},
+        "LogRetentionDays": {"Type": "String", "Default": "180", "AllowedValues": LOG_RETENTION_VALUES,
+                             "Description": f"日志组 /aws/lambda/{REALTIME_FUNCTION} 的保留天数，由函数运行时自己设置"},
     },
     "Resources": {
         "Function": {
             "Type": "AWS::Lambda::Function",
             "Properties": {
-                "FunctionName": "map-realtime-tagger",
+                "FunctionName": REALTIME_FUNCTION,
                 "Runtime": "python3.13",
                 "Handler": "index.lambda_handler",
                 "Role": {"Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/MapRealtimeTaggerRole"},
@@ -287,6 +301,7 @@ REALTIME_TEMPLATE = {
                     "MAPPING_PARAM": {"Ref": "MappingParameterArn"},
                     "TAG_KEY": {"Ref": "TagKey"},
                     "MODE": {"Ref": "Mode"},
+                    "LOG_RETENTION_DAYS": {"Ref": "LogRetentionDays"},
                 }},
                 "Code": {"ZipFile": Literal((ROOT / "realtime_tagger.py").read_text(encoding="utf-8"))},
             },

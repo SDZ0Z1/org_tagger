@@ -521,3 +521,9 @@ Resources:
                 Action: "ssm:GetParameter"
                 Resource:
                   Ref: "MappingParameterArn"
+              - Sid: "SetOwnLogRetention"
+                Effect: "Allow"
+                Action: "logs:PutRetentionPolicy"
+                Resource:
+                  - Fn::Sub: "arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:/aws/lambda/map-realtime-tagger"
+                  - Fn::Sub: "arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:/aws/lambda/map-realtime-tagger:*"

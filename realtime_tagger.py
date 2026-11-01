@@ -20,6 +20,8 @@ realtime_tagger.py
   TAG_VALUE      可选；填了就直接用这个值，不查映射表
   MODE           dryrun（默认，只写日志）或 apply（真正打标签）
   OVERWRITE      true 时覆盖已有的不同值；默认 false，记为 CONFLICT
+  LOG_RETENTION_DAYS  可选；本函数日志组的保留天数，如 180。每个执行环境第一次运行时设置一次，
+                      不填就不设置
 
 每处理一个资源，往 CloudWatch Logs 写一行 JSON，字段和 action 含义与 sweep_tagger.py 一致。
 
@@ -45,12 +47,14 @@ TAG_VALUE = os.environ.get("TAG_VALUE", "")
 APPLY = os.environ.get("MODE", "dryrun").lower() == "apply"
 OVERWRITE = os.environ.get("OVERWRITE", "false").lower() == "true"
 REGION = os.environ.get("AWS_REGION", "us-east-1")
+LOG_RETENTION_DAYS = os.environ.get("LOG_RETENTION_DAYS", "").strip()
 MAPPING_TTL = 300
 # 权限类错误重试也没用，直接记 FAILED
 NO_RETRY = {"AccessDenied", "AccessDeniedException", "UnauthorizedOperation", "UnauthorizedException"}
 
 _clients = {}
 _mapping = {"at": 0.0, "value": {}}
+_retention = {"done": False}
 
 
 # ----------------------------------------------------------------------------
@@ -117,6 +121,32 @@ def load_mapping():
         raise ValueError(f'{MAPPING_PARAM} 应该是 {{"*": "MPE 值", "账号ID": "MPE 值"}} 格式的 JSON 对象')
     _mapping.update(at=time.time(), value={str(k).strip(): str(v or "").strip() for k, v in mapping.items()})
     return _mapping["value"]
+
+
+def ensure_log_retention():
+    """把本函数自己的日志组设成 LOG_RETENTION_DAYS 天后过期。
+    日志组是 Lambda 第一次运行时自动建的，默认永不过期；它在大多数 region 里已经存在，
+    模板没法接管，所以由函数自己设。成功后本执行环境不再重复设置；
+    失败只记一行 WARN、不影响打标签，下次运行再试。"""
+    if _retention["done"] or not LOG_RETENTION_DAYS:
+        return
+    group = os.environ.get("AWS_LAMBDA_LOG_GROUP_NAME") or \
+        "/aws/lambda/" + os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "map-realtime-tagger")
+    try:
+        days = int(LOG_RETENTION_DAYS)
+        logs = client("logs")
+        try:
+            logs.put_retention_policy(logGroupName=group, retentionInDays=days)
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ResourceNotFoundException":
+                raise
+            # 一般走不到这里：Lambda 在函数运行前就会建好日志组
+            logs.create_log_group(logGroupName=group)
+            logs.put_retention_policy(logGroupName=group, retentionInDays=days)
+        _retention["done"] = True
+    except Exception as e:  # noqa: BLE001
+        log(action="WARN", detail=f"没能把日志组 {group} 的保留期设成 {LOG_RETENTION_DAYS} 天，"
+                                  f"下次运行再试：{str(e)[:300]}")
 
 
 def tag_value_for(account):
@@ -618,6 +648,7 @@ def process(kind, rtype, rid, value, base):
 
 
 def lambda_handler(event, context):
+    ensure_log_retention()
     d = dict(event.get("detail") or {})
     d.setdefault("awsRegion", event.get("region") or REGION)
     d.setdefault("recipientAccountId", event.get("account"))

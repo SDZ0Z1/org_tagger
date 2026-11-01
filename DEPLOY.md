@@ -299,7 +299,8 @@ aws ram get-resource-share-associations --association-type PRINCIPAL --region ap
 3. StackSet name 填 `map-tagger-realtime`。Parameters：
    - `MappingParameterArn`：2.3 记下的映射表 ARN；
    - `TagKey`：保持 `map-migrated`；
-   - `Mode`：先保持 `dryrun`。
+   - `Mode`：先保持 `dryrun`；
+   - `LogRetentionDays`：日志保留天数，保持 `180`（6 个月）。
 
    点 Next。
 4. Execution configuration 选 Active。点 Next。
@@ -322,7 +323,7 @@ aws ram get-resource-share-associations --association-type PRINCIPAL --region ap
 
 CloudTrail 事件投递到 EventBridge 一般要几分钟，偶尔会到 10 到 15 分钟。
 
-Lambda 的日志组 `/aws/lambda/map-realtime-tagger` 要等函数第一次运行时才会建出来。还没被触发过的 region 里，Monitor 页签或 CloudWatch 会提示日志组不存在（Log group does not exist），这是正常的。
+Lambda 的日志组 `/aws/lambda/map-realtime-tagger` 要等函数第一次运行时才会建出来。还没被触发过的 region 里，Monitor 页签或 CloudWatch 会提示日志组不存在（Log group does not exist），这是正常的。函数运行时会把日志组的保留期设成 `LogRetentionDays` 天，在 CloudWatch → Log groups 的 Retention 列能看到。
 
 看不到日志时，按顺序排查：
 
@@ -380,7 +381,7 @@ Lambda 的日志组 `/aws/lambda/map-realtime-tagger` 要等函数第一次运�
    - 日志里是 Connect timeout on endpoint URL，说明 CloudShell 连不上那个 region 的接口，栈根本没建；多半是那个 region 自身的问题，见第 5 步常见问题。
 3. 在映射表里单独写一行 Payer 的账号 ID 和要打的值。
 
-以后要改 Payer 里的实时层（切 `Mode`、更新代码），都用上面同一个循环，改参数或换新模板后再跑一次。
+以后要改 Payer 里的实时层（切 `Mode`、更新代码），都用上面同一个循环，改参数或换新模板后再跑一次。循环里没写的参数，已有的沿用现值，新增的用默认值。`LogRetentionDays` 默认 180，要用别的天数就在 `--parameter-overrides` 后面加上 `LogRetentionDays=<天数>`。
 
 ### 3.8 和账号负责人确认
 
@@ -489,6 +490,7 @@ fields account_id, region, type, resource, current_value, action, detail
 4. Timeframe 的 Time zone 选 `Asia/Kuala_Lumpur`，开始和结束时间留空。点 Next。
 5. Target 选 Templated targets 里的 AWS Lambda Invoke，Lambda function 选 `map-daily-sweep`，Payload 填 `{}`。点 Next。
 6. Settings 页的 Retry policy 保持默认；Permissions 选 Create new role for this schedule。点 Next，确认后点 Create schedule。
+7. 设置扫描日志的保留期：进入 CloudWatch → Log groups，勾选 `/aws/lambda/map-daily-sweep`，点 Actions → Edit retention setting，选 6 months (180 days)，点 Save。这个日志组在函数第一次运行后才会出现。实时层的日志组由函数按 `LogRetentionDays` 自己设置，不用手动改。
 
 ## 5. 日常运维与常见问题
 
@@ -501,6 +503,8 @@ fields account_id, region, type, resource, current_value, action, detail
 | 新账号第一天出现 `ERROR`，`type` 为 `assume_role` | 账号刚加入组织，扫描时 StackSets 还没部署完，第二天会恢复。持续出现就看 StackSets 的 Operations 页签 |
 | 实时层报 AccessDeniedException：no resource-based policy allows the ssm:GetParameter action | 映射表的 RAM 共享没生效。按 2.3 第 7 步检查：参数是不是 Advanced、共享是不是建在参数所在的 region、是不是共享给了整个组织 |
 | Lambda 的 Monitor 页签或 CloudWatch 提示日志组不存在 | 函数在这个 region 还没被触发过，日志组要第一次运行时才会建出来，属正常。建个测试资源触发一次就会出现 |
+| 实时层日志出现 `WARN`：没能把日志组的保留期设成 N 天 | 执行角色还没有 `logs:PutRetentionPolicy` 权限，多半是只更新了 `map-tagger-realtime`、还没更新 `map-tagger-roles`（Payer 里的角色也要更新）。按下面“升级到新版”更新角色即可。不影响打标签，权限补上后下次运行会自动设好 |
+| 改日志保留期 | 实时层：按 [3.9](#39-修改-stackset) 修改 `map-tagger-realtime`，选 Use current template，改 `LogRetentionDays`；Payer 的实时层在 3.7 的循环里加上 `LogRetentionDays=<天数>`。各 region 的日志组在函数下次运行时更新。每日扫描：在 CloudWatch → Log groups 里改 `/aws/lambda/map-daily-sweep` 的保留期 |
 | StackSet 实例 FAILED：should enable &lt;region&gt; | 该账号没启用这个 opt-in region，属正常，可以不管。账号以后启用了它，按 [3.9](#39-修改-stackset) 再提交一次就会部署上去 |
 | StackSet 实例 CANCELLED：Cancelled since failure tolerance has exceeded | 被别的失败连带取消。按 3.3 的部署选项（并发和失败容忍度都填 100%、Soft 模式），用 [3.9](#39-修改-stackset) 再提交一次 |
 | 某个 region 的 `ERROR` 是 InternalFailure、TooManyRequestsException 这类服务端错误 | botocore 已经重试过多次，说明那个 region 的服务端当时有问题，和代码、权限无关。偶尔出现可以忽略，第二天会自动补上；同一个 region 连续多天出现，在 AWS Health Dashboard 看看那个 region 有没有服务事件 |
@@ -535,3 +539,5 @@ fields account_id, region, type, resource, current_value, action, detail
 6. **扫描 Lambda**：把新版 `sweep_tagger.py` 的全部内容粘贴进 `map-daily-sweep` 的 `lambda_function.py`，点 Deploy。
 
 更新期间实时层照常运行。新增的资源类型从更新完成后开始实时打标签，已有的资源由下一次每日扫描补上。
+
+从没有 `LogRetentionDays` 参数的旧版升级时：参数不用手动填，默认就是 180 天。旧版建出来的日志组都是永不过期，升级后，函数在某个 region 下一次被触发时会把那里的日志组改成 180 天。很少有资源创建的 region 要等下一次触发才会改，那里的日志量本来就很小。
