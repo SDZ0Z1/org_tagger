@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyBillingConsole",
+      "Effect": "Deny",
+      "Action": [
+        "aws-portal:*", "account:*", "billing:*", "consolidatedbilling:*", "invoicing:*", "payments:*",
+        "tax:*", "freetier:*", "purchase-orders:*", "ce:*", "cur:*", "bcm-data-exports:*",
+        "bcm-dashboards:*", "bcm-pricing-calculator:*", "bcm-recommended-actions:*", "budgets:*",
+        "cost-optimization-hub:*", "billingconductor:*", "sustainability:*", "mapcredits:*"
+      ],
+      "Resource": "*",
+      "Condition": {"ArnNotLike": {"aws:PrincipalArn": ["arn:aws:iam::*:role/OrganizationAccountAccessRole", "arn:aws:iam::*:role/MapTaggerRole"]}}
+    }
+  ]
+}

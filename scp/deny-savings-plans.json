@@ -1,0 +1,12 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenySavingsPlans",
+      "Effect": "Deny",
+      "Action": ["savingsplans:*"],
+      "Resource": "*",
+      "Condition": {"ArnNotLike": {"aws:PrincipalArn": ["arn:aws:iam::*:role/OrganizationAccountAccessRole", "arn:aws:iam::*:role/MapTaggerRole"]}}
+    }
+  ]
+}

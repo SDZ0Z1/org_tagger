@@ -1,0 +1,24 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyReservations",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:PurchaseReservedInstancesOffering", "ec2:ModifyReservedInstances",
+        "ec2:AcceptReservedInstancesExchangeQuote", "ec2:CreateReservedInstancesListing",
+        "ec2:PurchaseHostReservation", "ec2:PurchaseScheduledInstances", "ec2:PurchaseCapacityBlock",
+        "ec2:PurchaseCapacityBlockExtension", "rds:PurchaseReservedDBInstancesOffering",
+        "elasticache:PurchaseReservedCacheNodesOffering", "memorydb:PurchaseReservedNodesOffering",
+        "es:PurchaseReservedInstanceOffering", "es:PurchaseReservedElasticsearchInstanceOffering",
+        "redshift:PurchaseReservedNodeOffering", "redshift:AcceptReservedNodeExchange",
+        "redshift-serverless:CreateReservation", "dynamodb:PurchaseReservedCapacityOfferings",
+        "sagemaker:CreateTrainingPlan", "sagemaker:ExtendTrainingPlan", "medialive:PurchaseOffering",
+        "mediaconnect:PurchaseOffering", "glacier:PurchaseProvisionedCapacity",
+        "devicefarm:PurchaseOffering"
+      ],
+      "Resource": "*",
+      "Condition": {"ArnNotLike": {"aws:PrincipalArn": ["arn:aws:iam::*:role/OrganizationAccountAccessRole"]}}
+    }
+  ]
+}

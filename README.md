@@ -29,7 +29,13 @@
 | [templates/map-tagger-roles.yaml](templates/map-tagger-roles.yaml) | StackSet 模板：`MapTaggerRole` 和实时层的执行角色 `MapRealtimeTaggerRole` |
 | [templates/map-tagger-realtime.yaml](templates/map-tagger-realtime.yaml) | StackSet 模板：实时层 Lambda 和 EventBridge 规则，代码内联在模板里 |
 | [make_templates.py](make_templates.py) | 生成上面两个模板。改了 `realtime_tagger.py` 或权限列表后重新运行 |
-| [DEPLOY.md](DEPLOY.md) | 部署与运维：Payer 配置、StackSets 下发、首次上线、常见问题 |
+| [scp/protect-admin-and-org-tagger.json](scp/protect-admin-and-org-tagger.json) | SCP：成员账号不能删改 org-tagger 的组件，也不能动管理员角色 `OrganizationAccountAccessRole` |
+| [scp/deny-billing-console.json](scp/deny-billing-console.json) | SCP：成员账号打不开账单与成本管理控制台 |
+| [scp/deny-savings-plans.json](scp/deny-savings-plans.json) | SCP：成员账号不能买 Savings Plans |
+| [scp/deny-reservations.json](scp/deny-reservations.json) | SCP：成员账号不能购买、修改、交换或转售各类预留 |
+| [scp/suspend-account.json](scp/suspend-account.json) | SCP：暂停一个账号时挂上，客户的所有操作都被拒绝，连查看也不行 |
+| [scp/suspend_account.py](scp/suspend_account.py) | 暂停或恢复一个账号里的资源（停止，不删除），在 Payer 的 CloudShell 里运行 |
+| [DEPLOY.md](DEPLOY.md) | 部署与运维：Payer 配置、StackSets 下发、首次上线、常见问题、SCP 护栏 |
 
 两个函数都是单文件，只用 Lambda 运行时自带的 boto3。扫描函数在 Payer 的控制台里粘贴代码；实时层的代码由 `make_templates.py` 内联进模板，随 StackSet 下发。
 
@@ -139,13 +145,13 @@ Payer 自己的资源也通过 `MapTaggerRole` 处理，但 `"*"` 不包括 Paye
 | Region | `ec2:elastic-ip` | 只含 VPC 弹性 IP（有 AllocationId 的） |
 | Region | `ec2:natgateway` | 只含 pending、available 状态 |
 | Region | `ec2:vpc-endpoint` | 不含 deleting、deleted、rejected、failed、expired 状态 |
+| Region | `ec2:network-interface` | 本账号拥有的全部网卡，包括服务代为创建的（requester-managed）。共享 VPC 里其它账号的网卡不处理 |
 | Region | `rds:db`、`rds:cluster` | |
 | Region | `rds:snapshot`、`rds:cluster-snapshot` | 只含手动快照 |
 | Region | `lambda:function` | |
 | Region | `elbv2:loadbalancer` | ALB、NLB、GWLB |
 | Region | `elb:loadbalancer` | Classic Load Balancer |
 | Region | `dynamodb:table` | |
-| Region | `ec2:network-interface` | 本账号拥有的全部网卡，包括服务代为创建的（requester-managed）。共享 VPC 里其它账号的网卡不处理 |
 | Region | `efs:file-system` | |
 | Region | `elasticache:cluster` | |
 | Region | `eks:cluster` | |

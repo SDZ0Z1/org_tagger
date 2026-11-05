@@ -68,6 +68,7 @@ flowchart TB
 3. [用 StackSets 部署到整个组织](#3-用-stacksets-部署到整个组织)：这时映射表里只有一个测试账号，用它验证实时层
 4. [首次上线](#4-首次上线)：试跑、把映射表改成 `"*"` 默认值、全量 dry-run、审日志、两层一起切到 apply、设置每天定时
 5. 进入[日常运维](#5-日常运维与常见问题)
+6. 可选：[用 SCP 加护栏](#6-用-scp-加护栏)：保护 org-tagger、隐藏账单、禁止购买预留，以及暂停账号
 
 第 3 步依赖第 2 步：`MapTaggerRole` 的信任策略要引用扫描 Lambda 的执行角色，实时层要用共享映射表的 ARN。
 
@@ -541,3 +542,119 @@ fields account_id, region, type, resource, current_value, action, detail
 更新期间实时层照常运行。新增的资源类型从更新完成后开始实时打标签，已有的资源由下一次每日扫描补上。
 
 从没有 `LogRetentionDays` 参数的旧版升级时：参数不用手动填，默认就是 180 天。旧版建出来的日志组都是永不过期，升级后，函数在某个 region 下一次被触发时会把那里的日志组改成 180 天。很少有资源创建的 region 要等下一次触发才会改，那里的日志量本来就很小。
+
+## 6. 用 SCP 加护栏
+
+`scp/` 下有五条 SCP（服务控制策略）。SCP 只对成员账号生效，对 Payer 不生效；它只能拒绝 API 调用，不会授予任何权限。
+
+| SCP | 挂在哪里 | 作用 |
+| --- | --- | --- |
+| [protect-admin-and-org-tagger.json](scp/protect-admin-and-org-tagger.json) | Root | 成员账号不能删改 org-tagger 的角色、实时层 Lambda、EventBridge 规则和 StackSet 建的栈；也不能新建、修改或删除 `OrganizationAccountAccessRole` |
+| [deny-billing-console.json](scp/deny-billing-console.json) | Root | 打不开账单与成本管理控制台，包括 Cost Explorer、预算、发票、MAP 积分等 |
+| [deny-savings-plans.json](scp/deny-savings-plans.json) | Root | 不能买 Savings Plans，也看不到已有的 |
+| [deny-reservations.json](scp/deny-reservations.json) | Root | 不能购买、修改、交换或转售各类预留：EC2 RI、专用主机、Capacity Blocks、RDS（含 Aurora、DocumentDB、Neptune）、ElastiCache、MemoryDB、OpenSearch、Redshift、DynamoDB、SageMaker 训练计划等 |
+| [suspend-account.json](scp/suspend-account.json) | 要暂停的账号，平时不挂 | 除了下面放行的角色，所有操作都拒绝，连查看也不行 |
+
+### 6.1 放行的角色
+
+SCP 按角色名放行下面几个角色：
+
+| 角色 | 在哪些 SCP 里放行 | 为什么 |
+| --- | --- | --- |
+| `OrganizationAccountAccessRole` | 全部 | 你从 Payer 切进成员账号用的管理员角色：能看账单、替客户买预留、执行暂停脚本 |
+| `stacksets-exec-*` | 保护、暂停 | StackSets 部署和更新 org-tagger 用的角色 |
+| `MapTaggerRole` | 账单控制台、Savings Plans、暂停 | 每日扫描。Cost Explorer 异常监控、数据导出、Savings Plans 这类资源也要它补标签 |
+| `MapRealtimeTaggerRole` | 暂停 | 实时层 |
+
+因为是按名字放行，保护 SCP 同时禁止成员账号新建、修改、删除这几个角色。否则客户可以自己建一个同名角色，或者改掉信任策略让自己能 assume，就绕过了所有 SCP。所以**其它几条都要在保护 SCP 挂上之后才有效**。
+
+受邀加入组织的账号默认没有 `OrganizationAccountAccessRole`，挂上保护 SCP 之后客户自己也建不了。挂之前，在 Payer 的 CloudShell 里确认每个账号都能进去：
+
+```bash
+for a in $(aws organizations list-accounts --query "Accounts[].Id" --output text); do echo "$a: $(aws sts assume-role --role-arn arn:aws:iam::$a:role/OrganizationAccountAccessRole --role-session-name check --query 'AssumedRoleUser.Arn' --output text 2>&1 | tail -1)"; done
+```
+
+能进去的账号会打印一个 `assumed-role/OrganizationAccountAccessRole/check` 的 ARN。Payer 自己会报错，属正常。其它报 AccessDenied 的账号，请客户先按 AWS 文档建好这个角色（信任 Payer 账号，附加 `AdministratorAccess`），再挂 SCP。
+
+### 6.2 创建并挂上 SCP
+
+1. 在 Payer 进入 AWS Organizations → Policies → Service control policies。还没启用的话点 Enable service control policies。启用后每个 Root、OU 和账号都会自动挂上 `FullAWSAccess`，保留它，删掉的话成员账号所有操作都会被拒绝。
+2. 点 Create policy，Policy name 填 `protect-admin-and-org-tagger`。把编辑器里的默认内容全部删掉，粘贴 `scp/protect-admin-and-org-tagger.json` 的内容，点 Create policy。
+3. 同样创建 `deny-billing-console`、`deny-savings-plans`、`deny-reservations` 和 `suspend-account`。`suspend-account` 只创建，先不挂。
+4. 建议先挂到一个测试账号上验证（见 6.3），确认没问题再挂到 Root：点进策略 → Targets 页签 → Attach → 选 Root → Attach policy。先挂保护 SCP，再挂另外三条。
+
+每个 Root、OU 或账号最多直接挂 5 条 SCP。挂完后 Root 上有 `FullAWSAccess` 和这四条，共 5 条，已经到上限。以后要在 Root 再加 SCP，就得把其中几条合并，或者改挂到 OU 上（挂在 OU 上只对该 OU 里的账号生效）。`suspend-account` 是挂在单个账号上的，不占 Root 的名额。
+
+### 6.3 验证
+
+在挂了 SCP 的测试账号里，用客户自己的管理员身份（不是 `OrganizationAccountAccessRole`）登录：
+
+- 打开 Billing and Cost Management，应该提示没有权限。
+- 在 CloudShell 里试买一个 RI。`--dry-run` 只检查权限，不会真的购买；应该报 explicit deny in a service control policy：
+
+  ```bash
+  aws ec2 purchase-reserved-instances-offering --instance-count 1 --dry-run --reserved-instances-offering-id $(aws ec2 describe-reserved-instances-offerings --instance-type t3.micro --max-results 5 --query "ReservedInstancesOfferings[0].ReservedInstancesOfferingId" --output text)
+  ```
+
+- 试改 org-tagger 的角色，应该报 explicit deny。万一 SCP 没生效，这条命令也只是改了角色的描述：
+
+  ```bash
+  aws iam update-role-description --role-name MapTaggerRole --description test
+  ```
+
+- 再从 Payer 用 `OrganizationAccountAccessRole` 切进这个账号，账单页面应该能正常打开。
+
+### 6.4 暂停一个账号
+
+SCP 只能挡住客户的操作，挡不住已经在运行的资源，也管不到 Auto Scaling 补实例、ECS 调度任务、Lambda 被事件触发这类服务代为执行的操作，所以还要用 `scp/suspend_account.py` 把资源停掉。它只停不删，暂停前的状态记在资源的 `org-suspend` 标签里，恢复时按标签还原。
+
+| 资源 | 暂停时 | 恢复时 |
+| --- | --- | --- |
+| Auto Scaling 组 | 暂停全部流程，不让它替换停掉的实例 | 恢复原来没暂停的流程 |
+| ECS 服务 | 期望任务数改成 0 | 改回原来的数 |
+| EC2 实例 | 停止（EMR 集群的节点除外） | 启动 |
+| RDS、Aurora、DocumentDB、Neptune | 停止 | 启动 |
+| Redshift 集群 | 暂停 | 恢复 |
+| SageMaker 笔记本 | 停止 | 启动 |
+| Lambda 函数 | 预留并发设成 0，所有调用被限流（org-tagger 自己的函数除外） | 改回原来的预留并发 |
+
+NAT 网关、负载均衡器、ElastiCache、OpenSearch、MSK、EMR、SageMaker 终端节点、EKS 控制平面、RDS 只读副本停不了，脚本只把它们列为 `CANNOT_PAUSE`，这些会继续计费。停掉的资源仍按存储收费：EBS 卷、快照、RDS 存储、S3、弹性 IP 等。
+
+步骤（在 Payer 的 CloudShell 里，先用 Actions → Upload file 上传 `scp/suspend_account.py`）：
+
+1. 先看会暂停什么，这一步不做任何改动：
+
+   ```bash
+   python3 suspend_account.py pause <账号ID>
+   ```
+
+2. 挂上 SCP：Organizations → Policies → `suspend-account` → Targets → Attach → 选这个账号。先挂 SCP，客户就没法在脚本停完之后再把资源启动起来。
+3. 执行暂停：
+
+   ```bash
+   python3 suspend_account.py pause <账号ID> --apply
+   ```
+
+4. 看输出：`PAUSED` 是已暂停，`CANNOT_PAUSE` 是停不了、会继续计费的，`FAILED` 看最后一列的原因。最后一行是各类的数量。
+5. **暂停期间每 7 天内再跑一次第 3 步**：RDS 和 Aurora 停止 7 天后会被 AWS 自动启动。重复运行是安全的，已经暂停的会显示 `ALREADY` 或直接跳过。
+
+只处理某几个 region 时加 `--regions ap-southeast-1,us-east-1`；默认处理该账号已启用的全部 region。
+
+### 6.5 恢复一个账号
+
+1. 恢复资源：
+
+   ```bash
+   python3 suspend_account.py resume <账号ID> --apply
+   ```
+
+2. 摘掉 SCP：Organizations → Policies → `suspend-account` → Targets，选中这个账号，点 Detach。
+
+恢复只处理带 `org-suspend` 标签的资源，暂停前就是停止状态的资源保持停止。
+
+### 6.6 注意事项
+
+- `deny-billing-console` 里的 `account:*` 除了账号信息页，还会挡住关闭账号、启用或停用 opt-in region、修改账号名和联系人。需要时由你用 `OrganizationAccountAccessRole` 切进去操作。
+- 暂停期间客户还能登录控制台，因为登录本身不受 SCP 限制，但每个页面都会报没有权限。CLI 和 SDK 的调用全部被拒绝，连 `aws sts get-caller-identity` 也不行；也开不了 Support 工单、改不了自己的密码。
+- 停不了的实例会显示 `FAILED`：Spot 实例、以实例存储为根卷的实例。只读副本和带只读副本的 RDS 实例显示 `CANNOT_PAUSE`。
+- Payer 里运行脚本的身份要有 `sts:AssumeRole` 权限。

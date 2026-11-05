@@ -1,0 +1,57 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ProtectExemptRoles",
+      "Effect": "Deny",
+      "Action": [
+        "iam:CreateRole", "iam:DeleteRole", "iam:UpdateRole", "iam:UpdateRoleDescription",
+        "iam:UpdateAssumeRolePolicy", "iam:PutRolePolicy", "iam:DeleteRolePolicy",
+        "iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:PutRolePermissionsBoundary",
+        "iam:DeleteRolePermissionsBoundary"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:role/OrganizationAccountAccessRole", "arn:aws:iam::*:role/MapTaggerRole",
+        "arn:aws:iam::*:role/MapRealtimeTaggerRole", "arn:aws:iam::*:role/stacksets-exec-*"
+      ],
+      "Condition": {"ArnNotLike": {"aws:PrincipalArn": ["arn:aws:iam::*:role/OrganizationAccountAccessRole", "arn:aws:iam::*:role/stacksets-exec-*"]}}
+    },
+    {
+      "Sid": "ProtectOrgTaggerLambda",
+      "Effect": "Deny",
+      "Action": [
+        "lambda:DeleteFunction", "lambda:UpdateFunctionCode", "lambda:UpdateFunctionConfiguration",
+        "lambda:PutFunctionConcurrency", "lambda:DeleteFunctionConcurrency", "lambda:AddPermission",
+        "lambda:RemovePermission", "lambda:PutFunctionEventInvokeConfig",
+        "lambda:UpdateFunctionEventInvokeConfig", "lambda:DeleteFunctionEventInvokeConfig",
+        "lambda:PutRuntimeManagementConfig"
+      ],
+      "Resource": [
+        "arn:aws:lambda:*:*:function:map-realtime-tagger",
+        "arn:aws:lambda:*:*:function:map-realtime-tagger:*"
+      ],
+      "Condition": {"ArnNotLike": {"aws:PrincipalArn": ["arn:aws:iam::*:role/OrganizationAccountAccessRole", "arn:aws:iam::*:role/stacksets-exec-*"]}}
+    },
+    {
+      "Sid": "ProtectOrgTaggerRule",
+      "Effect": "Deny",
+      "Action": [
+        "events:DeleteRule", "events:DisableRule", "events:PutRule", "events:PutTargets",
+        "events:RemoveTargets"
+      ],
+      "Resource": "arn:aws:events:*:*:rule/map-realtime-tagger",
+      "Condition": {"ArnNotLike": {"aws:PrincipalArn": ["arn:aws:iam::*:role/OrganizationAccountAccessRole", "arn:aws:iam::*:role/stacksets-exec-*"]}}
+    },
+    {
+      "Sid": "ProtectOrgTaggerStacks",
+      "Effect": "Deny",
+      "Action": [
+        "cloudformation:DeleteStack", "cloudformation:UpdateStack", "cloudformation:CreateChangeSet",
+        "cloudformation:ExecuteChangeSet", "cloudformation:SetStackPolicy",
+        "cloudformation:UpdateTerminationProtection"
+      ],
+      "Resource": "arn:aws:cloudformation:*:*:stack/StackSet-map-tagger-*",
+      "Condition": {"ArnNotLike": {"aws:PrincipalArn": ["arn:aws:iam::*:role/OrganizationAccountAccessRole", "arn:aws:iam::*:role/stacksets-exec-*"]}}
+    }
+  ]
+}
