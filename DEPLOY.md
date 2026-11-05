@@ -457,7 +457,7 @@ fields account_id, region, type, resource, current_value, action, detail
   | fields @timestamp, detail
   ```
 
-- **要打标签的是哪些资源**：按类型拆开看。其中会有 org-tagger 自己部署的资源，比如各 region 的 `map-realtime-tagger` Lambda，以及第二层补扫可能找到的 EventBridge 规则。它们几乎不产生费用，打上标签也没关系。
+- **要打标签的是哪些资源**：按类型拆开看。其中会有 org-tagger 自己部署的资源，比如各 region 的 `map-realtime-tagger` Lambda，以及第二层补扫可能找到的 EventBridge 规则。它们几乎不产生费用，打上标签也没关系。`ec2:network-interface`（网卡）通常数量较多：每台实例至少一块，ELB、RDS、VPC 内的 Lambda、VPC Endpoint 等服务也会建网卡。
 
   ```
   filter action = "WOULD_TAG"

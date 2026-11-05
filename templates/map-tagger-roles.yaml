@@ -46,6 +46,7 @@ Resources:
                   - "ec2:DescribeAddresses"
                   - "ec2:DescribeNatGateways"
                   - "ec2:DescribeVpcEndpoints"
+                  - "ec2:DescribeNetworkInterfaces"
                   - "rds:DescribeDBInstances"
                   - "rds:DescribeDBClusters"
                   - "rds:DescribeDBSnapshots"

@@ -41,7 +41,7 @@ SWEEP_READ_ACTIONS = [
     "tag:GetResources",
     "ec2:DescribeRegions", "ec2:DescribeInstances", "ec2:DescribeVolumes",
     "ec2:DescribeSnapshots", "ec2:DescribeImages", "ec2:DescribeAddresses",
-    "ec2:DescribeNatGateways", "ec2:DescribeVpcEndpoints",
+    "ec2:DescribeNatGateways", "ec2:DescribeVpcEndpoints", "ec2:DescribeNetworkInterfaces",
     "rds:DescribeDBInstances", "rds:DescribeDBClusters",
     "rds:DescribeDBSnapshots", "rds:DescribeDBClusterSnapshots",
     "lambda:ListFunctions", "lambda:ListTags",

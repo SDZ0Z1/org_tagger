@@ -110,8 +110,9 @@ class ServiceUnavailable(Exception):
 class Ctx:
     """一个账号 + 一个 region 的上下文，缓存 client。"""
 
-    def __init__(self, sess, region, key, value):
+    def __init__(self, sess, region, key, value, account=None):
         self.sess, self.region, self.key, self.value = sess, region, key, value
+        self.account = account
         self._clients = {}
 
     def client(self, service, region=None):
@@ -160,7 +161,7 @@ def _ec2(ctx, label, items, id_field):
     ec2 = ctx.client("ec2")
     for it in items:
         rid = it[id_field]
-        yield Res(label, rid, tdict(it.get("Tags")),
+        yield Res(label, rid, tdict(it.get("Tags") or it.get("TagSet")),   # 网卡的标签字段叫 TagSet
                   lambda rid=rid: ec2.create_tags(Resources=[rid], Tags=ctx.tagset()))
 
 
@@ -205,6 +206,16 @@ def h_ec2_vpce(ctx):
              if str(e.get("State", "")).lower() not in
              ("deleting", "deleted", "rejected", "failed", "expired"))
     yield from _ec2(ctx, "ec2:vpc-endpoint", items, "VpcEndpointId")
+
+
+def h_ec2_enis(ctx):
+    # 公网 IPv4 按网卡计费（实例自动分配的公网 IP 只能靠网卡上的标签分摊），
+    # 包括 ELB、RDS、Lambda 等服务代为创建的网卡。共享 VPC 里能看到别的账号的网卡，只处理本账号的
+    filters = [{"Name": "owner-id", "Values": [ctx.account]}] if ctx.account else []
+    yield from _ec2(ctx, "ec2:network-interface",
+                    paginate(ctx.client("ec2"), "describe_network_interfaces", "NetworkInterfaces",
+                             Filters=filters),
+                    "NetworkInterfaceId")
 
 
 def _rds(ctx, label, items, arn_field):
@@ -520,7 +531,7 @@ def h_sweep(ctx):
 GLOBAL_HANDLERS = [h_s3, h_cloudfront, h_route53]
 REGIONAL_HANDLERS = [
     h_ec2_instances, h_ec2_volumes, h_ec2_snapshots, h_ec2_images,
-    h_ec2_eips, h_ec2_natgw, h_ec2_vpce,
+    h_ec2_eips, h_ec2_natgw, h_ec2_vpce, h_ec2_enis,
     h_rds_instances, h_rds_clusters, h_rds_snapshots, h_rds_cluster_snapshots,
     h_lambda, h_elbv2, h_elb_classic, h_dynamodb, h_efs, h_elasticache, h_eks,
     h_sqs, h_sns, h_kms, h_dms, h_dms_serverless, h_kafka, h_route53_resolver,
@@ -623,9 +634,9 @@ def scan(acct, region, tag_value):
         return counts
 
     if region == "global":
-        ctx, handlers = Ctx(sess, "us-east-1", TAG_KEY, tag_value), GLOBAL_HANDLERS
+        ctx, handlers = Ctx(sess, "us-east-1", TAG_KEY, tag_value, acct), GLOBAL_HANDLERS
     else:
-        ctx = Ctx(sess, region, TAG_KEY, tag_value)
+        ctx = Ctx(sess, region, TAG_KEY, tag_value, acct)
         handlers = REGIONAL_HANDLERS + ([] if NO_SWEEP else [h_sweep])
 
     seen = set()   # 去重：第一层处理过的资源，第二层补扫时跳过

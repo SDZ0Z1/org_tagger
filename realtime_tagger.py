@@ -456,6 +456,13 @@ def from_req(kind, rtype, key, arn_fmt, lower=False):
     return extract
 
 
+def run_instances(d):
+    # 实例的网卡随实例一起创建，没有单独的 CreateNetworkInterface 事件。
+    # 自动分配的公网 IPv4 按网卡计费，所以网卡也要打标签
+    return (from_resp("ec2", "ec2:instance", "instanceId")(d)
+            + from_resp("ec2", "ec2:network-interface", "networkInterfaceId")(d))
+
+
 def lambda_function(d):
     # 发布了版本时 ARN 末尾带 :版本号，去掉，标签打在函数本身上
     return [("lambda", "lambda:function", ":".join(a.split(":")[:7]))
@@ -505,7 +512,9 @@ RDS = "rds.amazonaws.com"
 DDB = "dynamodb.amazonaws.com"
 
 EVENTS = {
-    (EC2, "RunInstances"): from_resp("ec2", "ec2:instance", "instanceId"),
+    (EC2, "RunInstances"): run_instances,
+    # 包括 ELB、RDS、Lambda、VPC Endpoint 等服务代为创建的网卡
+    (EC2, "CreateNetworkInterface"): from_resp("ec2", "ec2:network-interface", "networkInterfaceId"),
     (EC2, "CreateVolume"): from_resp("ec2", "ec2:volume", "volumeId"),
     (EC2, "CreateSnapshot"): from_resp("ec2", "ec2:snapshot", "snapshotId"),
     (EC2, "CreateSnapshots"): from_resp("ec2", "ec2:snapshot", "snapshotId"),
@@ -677,7 +686,7 @@ def lambda_handler(event, context):
     actions = [process(kind, rtype, rid, value, base) for kind, rtype, rid in targets]
     if name == "RunInstances":
         try:
-            vols = launch_volumes([rid for _, _, rid in targets])
+            vols = launch_volumes([rid for _, rtype, rid in targets if rtype == "ec2:instance"])
         except Exception as e:  # noqa: BLE001
             log(**base, type="ec2:volume", resource="", current_value="", action="ERROR", detail=str(e)[:500])
             actions.append("ERROR")

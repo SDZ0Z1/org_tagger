@@ -47,14 +47,15 @@ python make_templates.py
 2. EventBridge 规则按事件来源和事件名匹配，触发同 region 的 Lambda。规则只匹配下表里的创建类 API，不含 CreateTags 这类打标签操作，所以 Lambda 自己打标签不会再触发自己。
 3. Lambda 用完整 ARN 读取 Payer 共享过来的账号映射表，查出本账号该打的值：有自己的条目就用它，没有就用 `"*"`；映射表缓存 5 分钟。本账号被排除时记一行 `SKIP`，不处理。
 4. Lambda 从事件里取出新资源的 ID 或 ARN，读出现有标签，按上面的规则决定记为 `OK`、`CONFLICT`、`WOULD_TAG` 还是打上标签（`TAGGED`）。
-5. RunInstances 还会等实例进入 running，再给启动时一起创建的 EBS 卷打标签。这些卷没有单独的 CreateVolume 事件。
+5. RunInstances 会同时给实例的网卡打标签，还会等实例进入 running，再给启动时一起创建的 EBS 卷打标签。这些网卡和卷没有单独的 CreateNetworkInterface、CreateVolume 事件。
 6. 资源刚创建时，有的服务会拒绝读写标签。函数每 10 秒重试一次，最多 6 次；还失败就记 `FAILED`，并让这次调用报错，Lambda 默认会再重试两次。最终仍失败的，由第二天的每日扫描补上。
 
 ### 覆盖的 API
 
 | 资源类型 | 触发的 API |
 | --- | --- |
-| `ec2:instance` | RunInstances（连同启动时创建的 EBS 卷，记为 `ec2:volume`） |
+| `ec2:instance` | RunInstances（连同实例的网卡，记为 `ec2:network-interface`；以及启动时创建的 EBS 卷，记为 `ec2:volume`） |
+| `ec2:network-interface` | CreateNetworkInterface，包括 ELB、RDS、Lambda、VPC Endpoint 等服务代为创建的网卡。实例自动分配的公网 IPv4 按网卡计费，要给网卡打标签才能分摊这部分费用 |
 | `ec2:volume` | CreateVolume |
 | `ec2:snapshot` | CreateSnapshot、CreateSnapshots、CopySnapshot |
 | `ec2:image` | CreateImage、CopyImage、RegisterImage（AMI 背后的快照不在内，由每日扫描处理） |
@@ -144,6 +145,7 @@ Payer 自己的资源也通过 `MapTaggerRole` 处理，但 `"*"` 不包括 Paye
 | Region | `elbv2:loadbalancer` | ALB、NLB、GWLB |
 | Region | `elb:loadbalancer` | Classic Load Balancer |
 | Region | `dynamodb:table` | |
+| Region | `ec2:network-interface` | 本账号拥有的全部网卡，包括服务代为创建的（requester-managed）。共享 VPC 里其它账号的网卡不处理 |
 | Region | `efs:file-system` | |
 | Region | `elasticache:cluster` | |
 | Region | `eks:cluster` | |
@@ -288,7 +290,8 @@ def h_sns(ctx):
 - 映射表的 RAM 共享是按 region 的，要建在参数所在的 region，否则实时层读映射表会报 AccessDeniedException。
 - StackSets 部署到整个组织，被排除的账号里也会有两个角色和实时层 Lambda，只是空转。连这些资源都不能放的账号，要把部署目标改成按 OU 并避开它们所在的 OU（StackSets 的自动部署不认账号过滤，没法按账号排除）。
 - 服务托管的 StackSets 不会部署到管理账号，Payer 自己的资源要用普通 CloudFormation 栈单独部署。
-- 已在真实组织里部署并验证：StackSets 下发、实时层用 CreateVolume 走通了完整链路、每日扫描跑通了全量 dry-run。实时层其它 API 的事件解析是按 CloudTrail 的事件格式写的，只用模拟事件测试过；日志里出现 `NO_ID` 说明格式和预期不同。SQS、SNS、KMS 等后来新增的服务，两层都只用模拟数据和 botocore 的接口校验测试过，还没在真实账号里跑过。
+- 已在真实组织里部署并验证：StackSets 下发、实时层用 CreateVolume 走通了完整链路、每日扫描跑通了全量 dry-run。实时层其它 API 的事件解析是按 CloudTrail 的事件格式写的，只用模拟事件测试过；日志里出现 `NO_ID` 说明格式和预期不同。SQS、SNS、KMS 等后来新增的服务，以及网卡（ENI），两层都只用模拟数据和 botocore 的接口校验测试过，还没在真实账号里跑过。
+- 公网 IPv4 的费用记在网卡上，这一点 AWS 文档没有明说，来自第三方资料。网卡打上标签后，在 Cost Explorer 里按标签筛选看 VPC 服务的费用，确认这部分确实被归到标签下。
 - 每日扫描连不上某个 region（例如那个 region 本身出问题）时，那里会记 `ERROR`，那次扫描调用还会一直等到 15 分钟上限被强制结束，不影响其它 region。
 - `MapTaggerRole` 第二层的打标签权限是按 AWS 策略生成器当时的服务列表整理的。以后 AWS 新增的服务不在列表里，遇到 AccessDenied 时再补。
 - 实时层只是缩短空档。最可靠的仍然是创建资源时就带上标签：启动模板、Terraform 的 `default_tags`、Auto Scaling 组的 `PropagateAtLaunch=true` 等。
