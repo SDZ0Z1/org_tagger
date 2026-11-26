@@ -516,13 +516,29 @@ def h_cloudfront(ctx):
 #   budgets、payments         预算和付款方式本身不产生费用，Tagging API 也打不上
 SWEEP_SKIP_SERVICES = {"s3", "cloudfront", "route53", "cloudformation", "budgets", "payments"}
 
+# 补扫跳过的资源（服务 → ARN 里资源那一段的开头）：
+#   eks 的 pod/   EKS 的 Pod 是 Kubernetes 里的对象，不是 AWS 资源，打不上标签（TagResource 报
+#                 Invalid input resource arn）。开了 EKS 拆分成本分配数据的账号，GetResources 会把带 aws:eks:*
+#                 标签的 Pod 列出来。Pod 的费用算在它所在的节点（EC2 实例、EBS 卷）和集群上，那些照常打
+SWEEP_SKIP_RESOURCES = {"eks": ("pod/",)}
+
+
+def sweep_skipped(arn):
+    """补扫要不要跳过这个资源：整个服务跳过的，或者这个服务里打不上标签的那类资源。"""
+    parts = arn.split(":", 5)
+    svc = parts[2]
+    if svc in SWEEP_SKIP_SERVICES:
+        return True
+    resource = parts[5] if len(parts) > 5 else ""
+    return resource.startswith(SWEEP_SKIP_RESOURCES.get(svc, ()))
+
 
 def h_sweep(ctx):
     rgt = ctx.client("resourcegroupstaggingapi")
     for m in paginate(rgt, "get_resources", "ResourceTagMappingList"):
         arn = m["ResourceARN"]
         svc = arn.split(":")[2]
-        if svc in SWEEP_SKIP_SERVICES:
+        if sweep_skipped(arn):
             continue
         yield Res(f"{svc} (sweep)", arn, tdict(m.get("Tags")),
                   lambda arn=arn: rgt_tag(rgt, [arn], ctx.tagdict()), from_sweep=True)
